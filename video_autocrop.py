@@ -1793,6 +1793,50 @@ def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
     return curr
 
 
+def normalize_cli_args(raw_args: List[str]) -> List[str]:
+    """智能规范化与容错命令行参数 (兼容 -corp, -c, --crop 等)。"""
+    norm_args = []
+    i = 0
+    crop_geom_pattern = re.compile(r"^\d+:\d+(:\d+:\d+)?$")
+
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if arg == "-corp":
+            norm_args.append("-c")
+            i += 1
+            continue
+        if arg == "-crop":
+            arg = "--crop"
+        if arg in ("--crop", "--autocrop"):
+            if i + 1 < len(raw_args):
+                next_val = raw_args[i + 1]
+                if crop_geom_pattern.match(next_val):
+                    norm_args.extend(["--crop-size", next_val])
+                    i += 2
+                    continue
+            norm_args.append("-c")
+            i += 1
+            continue
+        if arg.startswith("--crop="):
+            crop_val = arg.split("=", 1)[1]
+            norm_args.extend(["--crop-size", crop_val])
+            i += 1
+            continue
+        if arg == "-c":
+            if i + 1 < len(raw_args):
+                next_val = raw_args[i + 1]
+                if crop_geom_pattern.match(next_val):
+                    norm_args.extend(["--crop-size", next_val])
+                    i += 2
+                    continue
+            norm_args.append("-c")
+            i += 1
+            continue
+        norm_args.append(arg)
+        i += 1
+    return norm_args
+
+
 def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Path]:
     """收集待处理视频文件列表。"""
     collected: List[Path] = []
@@ -1801,19 +1845,31 @@ def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Pa
     for pat in patterns:
         path_obj = normalize_and_resolve_path(pat)
         if path_obj.is_file():
-            res = path_obj.resolve()
-            if res not in seen:
-                seen.add(res)
-                collected.append(path_obj)
+            if not path_obj.name.startswith("._") and not path_obj.name.startswith("."):
+                res = path_obj.resolve()
+                if res not in seen:
+                    seen.add(res)
+                    collected.append(path_obj)
         elif path_obj.is_dir():
+            if not recursive:
+                try:
+                    has_subdirs = any(item.is_dir() and not item.name.startswith(".") for item in path_obj.iterdir())
+                    if has_subdirs:
+                        print(f"[提示] 检测到目录 '{path_obj.name}' 包含子文件夹。当前未开启 -r，仅扫描本级目录；若需遍历子目录请加上 -r 参数。")
+                except Exception:
+                    pass
+            else:
+                print(f"正在扫描目录: {path_obj} (递归遍历已开启)...")
+
             glob_func = path_obj.rglob if recursive else path_obj.glob
-            for ext in SUPPORTED_VIDEO_EXTENSIONS:
-                for f in glob_func(f"*{ext}"):
-                    if f.is_file():
-                        res = f.resolve()
-                        if res not in seen:
-                            seen.add(res)
-                            collected.append(f)
+            for f in glob_func("*"):
+                if f.name.startswith("._") or f.name.startswith("."):
+                    continue
+                if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                    res = f.resolve()
+                    if res not in seen:
+                        seen.add(res)
+                        collected.append(f)
         else:
             # 通配符匹配
             expanded_pat = os.path.expanduser(pat)
@@ -1829,11 +1885,24 @@ def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Pa
 
             for match_str in matched:
                 p = normalize_and_resolve_path(match_str)
-                if p.is_file() and p.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
-                    res = p.resolve()
-                    if res not in seen:
-                        seen.add(res)
-                        collected.append(p)
+                if p.is_file() and not p.name.startswith("._") and not p.name.startswith("."):
+                    if p.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                        res = p.resolve()
+                        if res not in seen:
+                            seen.add(res)
+                            collected.append(p)
+                elif p.is_dir():
+                    if recursive:
+                        print(f"正在扫描目录: {p} (递归遍历已开启)...")
+                    glob_func = p.rglob if recursive else p.glob
+                    for f in glob_func("*"):
+                        if f.name.startswith("._") or f.name.startswith("."):
+                            continue
+                        if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                            res = f.resolve()
+                            if res not in seen:
+                                seen.add(res)
+                                collected.append(f)
 
     return collected
 
@@ -1884,7 +1953,8 @@ def main():
 
     # 裁剪微调参数
     crop_group = parser.add_argument_group("黑边检测调优参数")
-    crop_group.add_argument("--crop", type=str, default=None, help="手动指定裁剪尺寸 W:H:X:Y (例如: 1920:800:0:140，跳过自动检测)")
+    crop_group.add_argument("-c", "--autocrop", action="store_true", help="启用智能自动去黑边 (默认即为自动去黑边)")
+    crop_group.add_argument("--crop", "--crop-size", dest="crop", type=str, default=None, help="手动指定裁剪尺寸 W:H:X:Y (例如: 1920:800:0:140，跳过自动检测)")
     crop_group.add_argument("-a", "--aspect", "--ratio", type=str, default=None,
                             help="强制锁定目标画幅比例并居中裁剪 (例如: 9:16, 2:3, 16:9, 2.39:1，特别适用于竖屏短剧精准提取标准画幅)")
     crop_group.add_argument("--limit", type=int, default=24, help="黑度检测阈值 0~255 (默认 24；越小对纯黑要求越严，暗场景防误切可调低至 12~16)")
@@ -1919,7 +1989,8 @@ def main():
     split_group.add_argument("--scan-step", type=float, default=None,
                              help="全片画幅扫描抽样间隔/秒 (默认自适应，通常 4~6 秒)")
 
-    args = parser.parse_args()
+    norm_argv = normalize_cli_args(sys.argv[1:])
+    args = parser.parse_args(norm_argv)
 
     if not check_ffmpeg():
         sys.exit(1)

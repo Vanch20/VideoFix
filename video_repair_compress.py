@@ -2252,6 +2252,66 @@ def process_merged_videos(
                 sf.unlink(missing_ok=True)
 
 
+def normalize_cli_args(raw_args: List[str]) -> List[str]:
+    """
+    智能规范化与容错命令行参数：
+    1. 彻底解决 -c / --crop 与位置参数 (inputs) 之间的贪婪吞噬冲突；
+    2. 兼容用户常见的简写/误拼输入：-corp, -crop, -rc, -cr 等；
+    3. 支持 -c 作为无参布尔开关，同时支持 -c 1920:800:0:140 或 --crop 1920:800:0:140 指定具体裁剪坐标。
+    """
+    norm_args = []
+    i = 0
+    crop_geom_pattern = re.compile(r"^\d+:\d+(:\d+:\d+)?$")
+
+    while i < len(raw_args):
+        arg = raw_args[i]
+
+        # 容错：用户误输入了 -corp (可能是 -crop 的误拼，或 -c 与 -r 的拼写)
+        if arg == "-corp":
+            norm_args.append("-c")
+            i += 1
+            continue
+
+        # 容错：单横杠 -crop
+        if arg == "-crop":
+            arg = "--crop"
+
+        if arg in ("--crop", "--autocrop"):
+            # 检查下一个参数是否是具体裁剪坐标 (如 1920:800:0:140 或 auto)
+            if i + 1 < len(raw_args):
+                next_val = raw_args[i + 1]
+                if crop_geom_pattern.match(next_val) or next_val.lower() == "auto":
+                    norm_args.extend(["--crop-size", next_val])
+                    i += 2
+                    continue
+            norm_args.append("-c")
+            i += 1
+            continue
+
+        if arg.startswith("--crop="):
+            crop_val = arg.split("=", 1)[1]
+            norm_args.extend(["--crop-size", crop_val])
+            i += 1
+            continue
+
+        if arg == "-c":
+            # 检查 -c 后面紧跟的是否是具体尺寸参数
+            if i + 1 < len(raw_args):
+                next_val = raw_args[i + 1]
+                if crop_geom_pattern.match(next_val) or next_val.lower() == "auto":
+                    norm_args.extend(["--crop-size", next_val])
+                    i += 2
+                    continue
+            norm_args.append("-c")
+            i += 1
+            continue
+
+        norm_args.append(arg)
+        i += 1
+
+    return norm_args
+
+
 def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bool = False) -> List[Path]:
     """收集输入路径列表或通配符匹配下的所有视频及 .part 残缺文件。"""
     collected = []
@@ -2261,7 +2321,12 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
     first_p = normalize_and_resolve_path(input_patterns[0]) if len(input_patterns) == 1 else None
     is_single_explicit_file = first_p.is_file() if first_p else False
 
-    def should_skip(stem: str) -> bool:
+    def should_skip(path: Path) -> bool:
+        name = path.name
+        # 严格过滤 macOS / SMB 共享盘上的 AppleDouble 隐藏资源文件 (如 ._video.mp4) 与普通隐藏文件
+        if name.startswith("._") or name.startswith("."):
+            return True
+        stem = path.stem
         if is_single_explicit_file:
             return False
         if is_merge:
@@ -2273,21 +2338,31 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
         p = normalize_and_resolve_path(pattern_str)
         if p.exists():
             if p.is_file():
-                if not should_skip(p.stem):
+                if not should_skip(p):
                     if is_supported_video_file(p) or probe_video(p) is not None:
                         res = p.resolve()
                         if res not in seen:
                             seen.add(res)
                             collected.append(res)
             elif p.is_dir():
+                # 友好检查与提示：未开启 -r 时提醒用户子目录情况
+                if not recursive:
+                    try:
+                        has_subdirs = any(item.is_dir() and not item.name.startswith(".") for item in p.iterdir())
+                        if has_subdirs:
+                            print(f"[提示] 检测到目录 '{p.name}' 包含子文件夹。当前未开启 -r，仅扫描本级目录；若需遍历子目录请加上 -r 参数。")
+                    except Exception:
+                        pass
+                else:
+                    print(f"正在扫描目录: {p} (递归遍历已开启)...")
+
                 iterator = p.rglob("*") if recursive else p.glob("*")
                 for f in iterator:
-                    if f.is_file() and is_supported_video_file(f):
-                        if not should_skip(f.stem):
-                            res = f.resolve()
-                            if res not in seen:
-                                seen.add(res)
-                                collected.append(res)
+                    if f.is_file() and not should_skip(f) and is_supported_video_file(f):
+                        res = f.resolve()
+                        if res not in seen:
+                            seen.add(res)
+                            collected.append(res)
             continue
 
         expanded_pattern = os.path.expanduser(pattern_str)
@@ -2303,20 +2378,20 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
 
         for m in matched:
             mp = normalize_and_resolve_path(m).resolve()
-            if mp.is_file() and is_supported_video_file(mp):
-                if not should_skip(mp.stem):
-                    if mp not in seen:
-                        seen.add(mp)
-                        collected.append(mp)
+            if mp.is_file() and not should_skip(mp) and is_supported_video_file(mp):
+                if mp not in seen:
+                    seen.add(mp)
+                    collected.append(mp)
             elif mp.is_dir():
+                if recursive:
+                    print(f"正在扫描目录: {mp} (递归遍历已开启)...")
                 iterator = mp.rglob("*") if recursive else mp.glob("*")
                 for f in iterator:
-                    if f.is_file() and is_supported_video_file(f):
-                        if not should_skip(f.stem):
-                            res = f.resolve()
-                            if res not in seen:
-                                seen.add(res)
-                                collected.append(res)
+                    if f.is_file() and not should_skip(f) and is_supported_video_file(f):
+                        res = f.resolve()
+                        if res not in seen:
+                            seen.add(res)
+                            collected.append(res)
 
     return sorted(collected, key=natural_sort_key)
 
@@ -2403,8 +2478,10 @@ def main():
                         help="合并前跳过交互式分卷顺序确认提示 (直接自动开始处理)")
 
     # 画幅与黑边裁剪
-    parser.add_argument("-c", "--crop", "--autocrop", dest="crop", nargs="?", const="auto", default=None, metavar="CROP",
-                        help="智能去除视频黑边 (默认 auto 自动检测并剔除字幕广告；亦可手动指定尺寸如 1920:800:0:140)")
+    parser.add_argument("-c", "--autocrop", dest="autocrop", action="store_true",
+                        help="智能去除视频黑边 (默认 auto 自动检测并剔除字幕广告与黑边)")
+    parser.add_argument("--crop", "--crop-size", dest="crop_size", type=str, default=None, metavar="W:H:X:Y",
+                        help="手动指定固定裁剪区域 (格式如 1920:800:0:140；若不指定则默认 auto 全自动检测)")
     parser.add_argument("-a", "--aspect", "--ratio", dest="aspect", type=str, default=None,
                         help="锁定目标画幅比例居中裁剪 (如 9:16, 2:3, 16:9, 2.39:1，短剧必备)")
     parser.add_argument("-s", "--split-scenes", "--split", dest="split_scenes", action="store_true",
@@ -2436,13 +2513,17 @@ def main():
     parser.add_argument("--force-repair-only", action="store_true",
                         help="强制仅修复损坏封装结构与音视频同步 (不重新编码，0 耗时)")
 
-    args = parser.parse_args()
+    norm_argv = normalize_cli_args(sys.argv[1:])
+    args = parser.parse_args(norm_argv)
 
     if not check_ffmpeg():
         sys.exit(1)
 
-    if (args.aspect or args.split_scenes) and not args.crop:
-        args.crop = "auto"
+    crop_setting = None
+    if args.crop_size:
+        crop_setting = args.crop_size
+    elif args.autocrop or args.aspect or args.split_scenes:
+        crop_setting = "auto"
 
     if args.cpu:
         encoder = "libx264" if args.h264 else "libx265"
@@ -2488,7 +2569,7 @@ def main():
                 force_compress=args.force_compress,
                 force_repair_only=is_merge_only or args.force_repair_only,
                 delete_source=args.delete_source,
-                crop=args.crop,
+                crop=crop_setting,
                 aspect=args.aspect,
                 split_scenes=args.split_scenes,
                 min_segment_duration=args.min_segment_duration,
@@ -2511,7 +2592,7 @@ def main():
                 merge_only=args.merge_only,
                 skip_confirm=args.yes,
                 delete_source=args.delete_source,
-                crop=args.crop,
+                crop=crop_setting,
                 aspect=args.aspect
             )
             print("\n" + "=" * 70)
@@ -2537,7 +2618,7 @@ def main():
             force_compress=args.force_compress,
             force_repair_only=args.force_repair_only,
             delete_source=args.delete_source,
-            crop=args.crop,
+            crop=crop_setting,
             aspect=args.aspect,
             split_scenes=args.split_scenes,
             min_segment_duration=args.min_segment_duration,
