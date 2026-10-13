@@ -927,7 +927,7 @@ def build_video_encode_args(
         else:
             max_limit = int(target_bps * 1.25)
         args += ["-maxrate", str(max_limit), "-bufsize", str(int(target_bps * 2.0))]
-        args += color_args
+        # 注意：RKMPP 硬件编码切勿追加 color_args，否则 FFmpeg 会插入 CPU 软件颜色滤镜导致吞吐骤降
 
     elif encoder == "hevc_rkmpp":
         args = [
@@ -944,7 +944,7 @@ def build_video_encode_args(
         else:
             max_limit = int(target_bps * 1.25)
         args += ["-maxrate", str(max_limit), "-bufsize", str(int(target_bps * 2.0))]
-        args += color_args
+        # 注意：RKMPP 硬件编码切勿追加 color_args，否则 FFmpeg 会插入 CPU 软件颜色滤镜导致吞吐骤降
 
     elif encoder == "libx264":
         args = [
@@ -1028,7 +1028,19 @@ def should_compress(
     if codec == "h264" and is_target_hevc:
         saving_ratio = (ref_orig_bitrate - expected_bitrate) / ref_orig_bitrate
         if saving_ratio >= 0.15:
-            return True, f"原片为 H.264 ({format_bitrate(ref_orig_bitrate)})，转换为 Apple HEVC 硬件编码预计可节省 ~{saving_ratio*100:.0f}% 存储空间"
+            if "rkmpp" in encoder:
+                hw_desc = "Rockchip HEVC 硬件编码"
+            elif "videotoolbox" in encoder:
+                hw_desc = "Apple VideoToolbox HEVC 硬件编码"
+            elif "nvenc" in encoder:
+                hw_desc = "NVENC HEVC 硬件编码"
+            elif "qsv" in encoder:
+                hw_desc = "Intel QSV HEVC 硬件编码"
+            elif "vaapi" in encoder:
+                hw_desc = "VAAPI HEVC 硬件编码"
+            else:
+                hw_desc = "HEVC/H.265 编码"
+            return True, f"原片为 H.264 ({format_bitrate(ref_orig_bitrate)})，转换为 {hw_desc} 预计可节省 ~{saving_ratio*100:.0f}% 存储空间"
 
     # 4. 常规码率阈值收益判定
     if ref_orig_bitrate <= expected_bitrate:

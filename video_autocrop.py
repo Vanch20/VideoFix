@@ -1226,7 +1226,7 @@ def process_video_with_splits(
                     "-g", str(gop_size),
                     "-maxrate", str(max_rate_limit),
                     "-bufsize", str(buf_size_limit)
-                ] + color_args
+                ]
             elif encoder == "h264_rkmpp":
                 video_args = [
                     "-c:v", "h264_rkmpp",
@@ -1237,7 +1237,7 @@ def process_video_with_splits(
                     "-g", str(gop_size),
                     "-maxrate", str(max_rate_limit),
                     "-bufsize", str(buf_size_limit)
-                ] + color_args
+                ]
             else:
                 video_args = [
                     "-c:v", "h264_videotoolbox",
@@ -1619,7 +1619,7 @@ def process_single_video(
                 "-g", str(gop_size),
                 "-maxrate", str(max_rate_limit),
                 "-bufsize", str(buf_size_limit)
-            ] + color_args
+            ]
         elif encoder == "h264_rkmpp":
             video_args = [
                 "-c:v", "h264_rkmpp",
@@ -1630,7 +1630,7 @@ def process_single_video(
                 "-g", str(gop_size),
                 "-maxrate", str(max_rate_limit),
                 "-bufsize", str(buf_size_limit)
-            ] + color_args
+            ]
         else:
             video_args = [
                 "-c:v", "h264_videotoolbox",
