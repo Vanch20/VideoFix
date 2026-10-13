@@ -167,6 +167,52 @@ def has_videotoolbox_hevc_support() -> bool:
         return False
 
 
+def has_rkmpp_support() -> bool:
+    """检测当前系统及 FFmpeg 是否支持 Rockchip MPP H.264 硬件加速。"""
+    if platform.system() != "Linux":
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        return "h264_rkmpp" in proc.stdout
+    except Exception:
+        return False
+
+
+def has_rkmpp_hevc_support() -> bool:
+    """检测当前系统及 FFmpeg 是否支持 Rockchip MPP HEVC/H.265 硬件加速。"""
+    if platform.system() != "Linux":
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        return "hevc_rkmpp" in proc.stdout
+    except Exception:
+        return False
+
+
+def get_hwaccel_decode_args(file_path: Path, codec: str) -> List[str]:
+    """根据文件状态与编码格式，智能决定是否启用硬件解码加速。"""
+    lower_path = str(file_path).lower()
+    # 残缺/临时下载中的文件优先 CPU 软件容错解码，确保 100% 抢救成功率
+    if any(lower_path.endswith(ext) for ext in TEMP_DOWNLOAD_EXTENSIONS):
+        return []
+    # Rockchip RKMPP 硬解支持主流高清编码：h264, hevc, h265, vp9, av1 等
+    if has_rkmpp_support() and codec.lower() in ("h264", "hevc", "h265", "vp9", "av1"):
+        return ["-hwaccel", "rkmpp"]
+    return []
+
+
 def format_bytes(size_bytes: int) -> str:
     """将字节大小格式化为人类可读的字符串。"""
     if size_bytes < 1024:
@@ -867,6 +913,39 @@ def build_video_encode_args(
         args += ["-maxrate", str(max_limit), "-bufsize", str(int(target_bps * 2.0))]
         args += color_args
 
+    elif encoder == "h264_rkmpp":
+        args = [
+            "-c:v", "h264_rkmpp",
+            "-b:v", str(target_bps),
+            "-profile", "high",
+            "-rc_mode", "0",
+            "-pix_fmt", "yuv420p",
+            "-g", str(gop_size),
+        ]
+        if orig_v_bitrate > 0:
+            max_limit = min(int(target_bps * 1.25), int(orig_v_bitrate))
+        else:
+            max_limit = int(target_bps * 1.25)
+        args += ["-maxrate", str(max_limit), "-bufsize", str(int(target_bps * 2.0))]
+        args += color_args
+
+    elif encoder == "hevc_rkmpp":
+        args = [
+            "-c:v", "hevc_rkmpp",
+            "-b:v", str(target_bps),
+            "-profile", "main",
+            "-rc_mode", "0",
+            "-tag:v", "hvc1",
+            "-pix_fmt", "yuv420p",
+            "-g", str(gop_size),
+        ]
+        if orig_v_bitrate > 0:
+            max_limit = min(int(target_bps * 1.25), int(orig_v_bitrate))
+        else:
+            max_limit = int(target_bps * 1.25)
+        args += ["-maxrate", str(max_limit), "-bufsize", str(int(target_bps * 2.0))]
+        args += color_args
+
     elif encoder == "libx264":
         args = [
             "-c:v", "libx264",
@@ -1239,17 +1318,17 @@ def process_video(
     else:
         target_bps = expected_bps
 
-    is_hardware = "videotoolbox" in encoder
+    is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
     target_w = out_w if crop_applied else width
     target_h = out_h if crop_applied else height
 
     # 智能硬件编码门槛判断：
-    # Apple VideoToolbox 在 Apple Silicon (arm64) 上原生极速支持全分辨率压制；
+    # Apple Silicon 与 Rockchip RK3588 (arm64) 原生极速支持全分辨率压制；
     # 仅早期 Intel 核显存在 >= 640x360 的限制
-    is_apple_silicon = platform.machine().lower() in ("arm64", "aarch64")
-    if is_hardware and not is_apple_silicon and (target_w < 640 or target_h < 360):
+    is_arm_arch = platform.machine().lower() in ("arm64", "aarch64")
+    if is_hardware and not is_arm_arch and (target_w < 640 or target_h < 360):
         fallback_cpu = "libx265" if "hevc" in encoder else "libx264"
-        print(f"  * 提示: 视频分辨率 ({target_w}x{target_h}) 偏小且处于 Intel 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
+        print(f"  * 提示: 视频分辨率 ({target_w}x{target_h}) 偏小且处于 x86_64 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
         encoder = fallback_cpu
         is_hardware = False
 
@@ -1264,7 +1343,8 @@ def process_video(
 
     if need_compress:
         if is_hardware:
-            print(f"  * 编码配置: Apple VideoToolbox 硬件极速加速 ({encoder}) | 目标码率: ~{format_bitrate(target_bps)}")
+            hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+            print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder}) | 目标码率: ~{format_bitrate(target_bps)}")
         else:
             print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset}) | 目标码率: ~{format_bitrate(target_bps)}")
     print(f"  * 策略决策: [{'修复并转码压缩' if need_compress else '仅修复重新封装'}] -> {reason}")
@@ -1301,7 +1381,22 @@ def process_video(
         # -err_detect ignore_err: 解码时容忍并跳过损坏数据
         # -fflags +discardcorrupt: 容错丢弃不可恢复损坏包
         # -max_muxing_queue_size 2048: 防止音画错位导致队列溢出
-        base_args = [
+        hw_decode_args = get_hwaccel_decode_args(file_path, codec)
+        base_args = (
+            ["ffmpeg", "-y"]
+            + hw_decode_args
+            + [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-max_error_rate", "1.0",
+                "-err_detect", "ignore_err",
+                "-fflags", "+discardcorrupt",
+                "-i", str(file_path),
+                "-max_muxing_queue_size", "2048"
+            ]
+        )
+
+        sw_base_args = [
             "ffmpeg", "-y",
             "-hide_banner",
             "-loglevel", "error",
@@ -1332,18 +1427,21 @@ def process_video(
             t_salvage = time.time()
             if extract_vorbis_acm_audio(file_path, salvaged_audio_file, target_audio_kbps):
                 print(f"    -> Vorbis ACM 音频抢救成功并转为 AAC (耗时: {time.time()-t_salvage:.1f}s, 大小: {format_bytes(salvaged_audio_file.stat().st_size)})")
-                base_args = [
-                    "ffmpeg", "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-max_error_rate", "1.0",
-                    "-err_detect", "ignore_err",
-                    "-fflags", "+discardcorrupt",
-                    "-i", str(file_path),
-                    "-err_detect", "ignore_err",
-                    "-i", str(salvaged_audio_file),
-                    "-max_muxing_queue_size", "2048"
-                ]
+                base_args = (
+                    ["ffmpeg", "-y"]
+                    + hw_decode_args
+                    + [
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-max_error_rate", "1.0",
+                        "-err_detect", "ignore_err",
+                        "-fflags", "+discardcorrupt",
+                        "-i", str(file_path),
+                        "-err_detect", "ignore_err",
+                        "-i", str(salvaged_audio_file),
+                        "-max_muxing_queue_size", "2048"
+                    ]
+                )
                 map_args = ["-map", "0:v:0", "-map", "1:a:0"]
                 audio_args = ["-c:a", "copy"]
             else:
@@ -1396,6 +1494,24 @@ def process_video(
                     str(temp_output_file)
                 ]
                 success, last_err_msg = execute_ffmpeg(cmd_transcode)
+                if not success and is_hardware:
+                    fallback_video_args = build_video_encode_args(
+                        encoder="libx264",
+                        target_bps=target_bps,
+                        orig_v_bitrate=orig_v_bitrate,
+                        crf=crf,
+                        preset=preset,
+                        gop_size=gop_size,
+                        keyint_min=keyint_min,
+                        width=target_w,
+                        height=target_h
+                    )
+                    cmd_transcode_sw = sw_base_args + map_args + vf_fix_args + fallback_video_args + audio_args + [
+                        "-avoid_negative_ts", "make_zero",
+                        "-movflags", "+faststart",
+                        str(temp_output_file)
+                    ]
+                    success, last_err_msg = execute_ffmpeg(cmd_transcode_sw)
         else:
             fps_val = float(info.get("fps", 30.0) or 30.0)
             gop_size = max(15, int(fps_val * 2))
@@ -1421,9 +1537,9 @@ def process_video(
             ]
             success, last_err_msg = execute_ffmpeg(cmd_compress)
 
-            # 硬件编码器遇到不支持的特殊分辨率（如小分辨率老视频）时，自动平滑切换至 CPU 软件编码
+            # 硬件编码器遇到不支持的特殊分辨率或破损包时，自动平滑切换至 CPU 软件容错编码
             if not success and is_hardware:
-                print("  [提示] 硬件编码器不支持该特殊分辨率规格或遇异常，自动平滑切换至 CPU 软件编码优化...")
+                print("  [提示] 硬件加速不支持该特殊分辨率规格或遇破损异常，自动平滑切换至 CPU 软件容错编码优化...")
                 fallback_video_args = build_video_encode_args(
                     encoder="libx264",
                     target_bps=target_bps,
@@ -1435,7 +1551,7 @@ def process_video(
                     width=target_w,
                     height=target_h
                 )
-                cmd_sw_fallback = base_args + map_args + vf_fix_args + fallback_video_args + audio_args + [
+                cmd_sw_fallback = sw_base_args + map_args + vf_fix_args + fallback_video_args + audio_args + [
                     "-avoid_negative_ts", "make_zero",
                     "-movflags", "+faststart",
                     str(temp_output_file)
@@ -1685,12 +1801,12 @@ def process_merged_videos(
             target_bps = expected_bps
         merge_crf = crf
 
-    is_hardware = "videotoolbox" in encoder
-    is_apple_silicon = platform.machine().lower() in ("arm64", "aarch64")
-    if is_hardware and not is_apple_silicon and (max_w < 640 or max_h < 360):
+    is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
+    is_arm_arch = platform.machine().lower() in ("arm64", "aarch64")
+    if is_hardware and not is_arm_arch and (max_w < 640 or max_h < 360):
         fallback_cpu = "libx265" if "hevc" in encoder else "libx264"
         if not is_merge_only:
-            print(f"  * 提示: 目标分辨率 ({max_w}x{max_h}) 偏小且处于 Intel 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
+            print(f"  * 提示: 目标分辨率 ({max_w}x{max_h}) 偏小且处于 x86_64 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
         encoder = fallback_cpu
         is_hardware = False
 
@@ -1849,7 +1965,8 @@ def process_merged_videos(
             if not is_merge_only:
                 print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
                 if is_hardware:
-                    print(f"  * 编码配置: Apple VideoToolbox 硬件极速加速 ({encoder})")
+                    hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+                    print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
                 else:
                     print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
             else:
@@ -1959,7 +2076,8 @@ def process_merged_videos(
     if not is_merge_only:
         print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
         if is_hardware:
-            print(f"  * 编码配置: Apple VideoToolbox 硬件极速加速 ({encoder})")
+            hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+            print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
         else:
             print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
     else:
@@ -2194,12 +2312,18 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
 def main():
     has_vt_h264 = has_videotoolbox_support()
     has_vt_hevc = has_videotoolbox_hevc_support()
+    has_rk_h264 = has_rkmpp_support()
+    has_rk_hevc = has_rkmpp_hevc_support()
 
-    # 默认编码器选择：在支持 VideoToolbox HEVC 的平台（如 Apple Silicon Mac）上，默认采用 HEVC GPU 极速减半
+    # 默认编码器选择：在支持硬件加速的平台上默认采用最高能效硬件极速压制
     if has_vt_hevc:
         default_encoder = "hevc_videotoolbox"
     elif has_vt_h264:
         default_encoder = "h264_videotoolbox"
+    elif has_rk_hevc:
+        default_encoder = "hevc_rkmpp"
+    elif has_rk_h264:
+        default_encoder = "h264_rkmpp"
     else:
         default_encoder = "libx264"
 
@@ -2289,7 +2413,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.20,
                         help="预估体积缩减阈值 (默认 0.20 即 20%%；若重编码收益低于此比例将自动跳过以保护画质)")
     parser.add_argument("--encoder", type=str, default=default_encoder,
-                        choices=["hevc_videotoolbox", "h264_videotoolbox", "libx264", "libx265"],
+                        choices=["hevc_videotoolbox", "h264_videotoolbox", "hevc_rkmpp", "h264_rkmpp", "libx264", "libx265"],
                         help=f"视频编码器 (当前系统默认最优: {default_encoder})")
     parser.add_argument("--h264", action="store_true",
                         help="指定输出为 H.264 编码 (保证极其老旧的电视或老旧播放器设备兼容性)")
@@ -2311,13 +2435,28 @@ def main():
     if args.cpu:
         encoder = "libx264" if args.h264 else "libx265"
     elif args.h264:
-        encoder = "h264_videotoolbox" if has_vt_h264 else "libx264"
+        if has_vt_h264:
+            encoder = "h264_videotoolbox"
+        elif has_rk_h264:
+            encoder = "h264_rkmpp"
+        else:
+            encoder = "libx264"
     else:
         encoder = args.encoder
     output_target = normalize_and_resolve_path(args.output_dir).resolve() if args.output_dir else None
 
     is_merge = args.merge or args.merge_only
     is_merge_only = args.merge_only or (args.merge and args.force_repair_only)
+
+    def get_engine_desc(enc: str) -> str:
+        return {
+            "hevc_videotoolbox": "Apple VideoToolbox HEVC/H.265 GPU 硬件极速加速 (体积减半、高画质、低发热)",
+            "h264_videotoolbox": "Apple VideoToolbox H.264 GPU 硬件加速 (极速、高兼容、低发热)",
+            "hevc_rkmpp": "Rockchip RKMPP HEVC/H.265 硬件极速加速 (VPU硬压、体积小、超高速)",
+            "h264_rkmpp": "Rockchip RKMPP H.264 硬件极速加速 (VPU硬压、高兼容、超高速)",
+            "libx265": f"CPU 软件高效编码 libx265 (CRF: {args.crf}, Preset: {args.preset})",
+            "libx264": f"CPU 软件标准编码 libx264 (CRF: {args.crf}, Preset: {args.preset})"
+        }.get(enc, f"{enc} 编码引擎")
 
     video_files = collect_video_files(args.inputs, args.recursive, is_merge=is_merge)
     if not video_files:
@@ -2347,13 +2486,7 @@ def main():
             sys.exit(0 if ok else 1)
         else:
             if not is_merge_only:
-                engine_desc = {
-                    "hevc_videotoolbox": "Apple VideoToolbox HEVC/H.265 GPU 硬件极速加速 (体积减半、高画质、低发热)",
-                    "h264_videotoolbox": "Apple VideoToolbox H.264 GPU 硬件加速 (极速、高兼容、低发热)",
-                    "libx265": f"CPU 软件高效编码 libx265 (CRF: {args.crf}, Preset: {args.preset})",
-                    "libx264": f"CPU 软件标准编码 libx264 (CRF: {args.crf}, Preset: {args.preset})"
-                }.get(encoder, f"{encoder} 编码引擎")
-                print(f"加速引擎: [{engine_desc}]")
+                print(f"加速引擎: [{get_engine_desc(encoder)}]")
 
             ok = process_merged_videos(
                 file_paths=video_files,
@@ -2375,13 +2508,7 @@ def main():
             sys.exit(0 if ok else 1)
 
     print(f"找到 {len(video_files)} 个待处理视频文件。")
-    engine_desc = {
-        "hevc_videotoolbox": "Apple VideoToolbox HEVC/H.265 GPU 硬件极速加速 (体积减半、高画质、低发热)",
-        "h264_videotoolbox": "Apple VideoToolbox H.264 GPU 硬件加速 (极速、高兼容、低发热)",
-        "libx265": f"CPU 软件高效编码 libx265 (CRF: {args.crf}, Preset: {args.preset})",
-        "libx264": f"CPU 软件标准编码 libx264 (CRF: {args.crf}, Preset: {args.preset})"
-    }.get(encoder, f"{encoder} 编码引擎")
-    print(f"加速引擎: [{engine_desc}]")
+    print(f"加速引擎: [{get_engine_desc(encoder)}]")
 
     success_count = 0
     fail_count = 0

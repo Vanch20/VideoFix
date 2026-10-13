@@ -103,6 +103,40 @@ def has_videotoolbox_hevc_support() -> bool:
         return False
 
 
+def has_rkmpp_support() -> bool:
+    """检测当前系统及 FFmpeg 是否支持 Rockchip MPP H.264 硬件加速。"""
+    if platform.system() != "Linux":
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        return "h264_rkmpp" in proc.stdout
+    except Exception:
+        return False
+
+
+def has_rkmpp_hevc_support() -> bool:
+    """检测当前系统及 FFmpeg 是否支持 Rockchip MPP HEVC/H.265 硬件加速。"""
+    if platform.system() != "Linux":
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        return "hevc_rkmpp" in proc.stdout
+    except Exception:
+        return False
+
+
 def format_bytes(size_bytes: int) -> str:
     """将字节大小格式化为人类可读的字符串。"""
     if size_bytes < 1024:
@@ -1163,6 +1197,7 @@ def process_video_with_splits(
             calc_bps = int(ref_v_bitrate * pixel_ratio * 0.95)
             target_bps = max(120_000, min(int(ref_v_bitrate), calc_bps))
 
+        is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
         video_args: List[str] = []
         if is_hardware:
             max_rate_limit = min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15))
@@ -1175,6 +1210,29 @@ def process_video_with_splits(
                     "-spatial_aq", "1",
                     "-bf", "2",
                     "-tag:v", "hvc1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ] + color_args
+            elif encoder == "hevc_rkmpp":
+                video_args = [
+                    "-c:v", "hevc_rkmpp",
+                    "-b:v", str(target_bps),
+                    "-profile", "main",
+                    "-rc_mode", "0",
+                    "-tag:v", "hvc1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ] + color_args
+            elif encoder == "h264_rkmpp":
+                video_args = [
+                    "-c:v", "h264_rkmpp",
+                    "-b:v", str(target_bps),
+                    "-profile", "high",
+                    "-rc_mode", "0",
                     "-pix_fmt", "yuv420p",
                     "-g", str(gop_size),
                     "-maxrate", str(max_rate_limit),
@@ -1493,7 +1551,7 @@ def process_single_video(
         print("  * 音频策略: [无音频流]")
 
     # 7. 构建视频编码参数
-    is_hardware = "videotoolbox" in encoder
+    is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
     gop_size = max(15, int(fps * 2))
 
     src_primaries = info.get("color_primaries")
@@ -1550,6 +1608,29 @@ def process_single_video(
                 "-maxrate", str(max_rate_limit),
                 "-bufsize", str(buf_size_limit)
             ] + color_args
+        elif encoder == "hevc_rkmpp":
+            video_args = [
+                "-c:v", "hevc_rkmpp",
+                "-b:v", str(target_bps),
+                "-profile", "main",
+                "-rc_mode", "0",
+                "-tag:v", "hvc1",
+                "-pix_fmt", "yuv420p",
+                "-g", str(gop_size),
+                "-maxrate", str(max_rate_limit),
+                "-bufsize", str(buf_size_limit)
+            ] + color_args
+        elif encoder == "h264_rkmpp":
+            video_args = [
+                "-c:v", "h264_rkmpp",
+                "-b:v", str(target_bps),
+                "-profile", "high",
+                "-rc_mode", "0",
+                "-pix_fmt", "yuv420p",
+                "-g", str(gop_size),
+                "-maxrate", str(max_rate_limit),
+                "-bufsize", str(buf_size_limit)
+            ] + color_args
         else:
             video_args = [
                 "-c:v", "h264_videotoolbox",
@@ -1562,7 +1643,8 @@ def process_single_video(
                 "-maxrate", str(max_rate_limit),
                 "-bufsize", str(buf_size_limit)
             ] + color_args
-        print(f"  * 编码引擎: [Apple VideoToolbox GPU 极速硬件加速] ({encoder})")
+        hw_label = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+        print(f"  * 编码引擎: [{hw_label} 硬件极速加速] ({encoder})")
         print(f"    - 原视频码率: ~{format_bitrate(orig_bitrate)} (纯视频: ~{format_bitrate(ref_v_bitrate)})")
         print(f"    - 防膨胀目标码率: ~{format_bitrate(target_bps)} (像素减少 {(1-pixel_ratio)*100:.1f}%%，码率等比缩减)")
     else:
@@ -1759,12 +1841,18 @@ def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Pa
 def main():
     has_vt_h264 = has_videotoolbox_support()
     has_vt_hevc = has_videotoolbox_hevc_support()
+    has_rk_h264 = has_rkmpp_support()
+    has_rk_hevc = has_rkmpp_hevc_support()
 
     # 默认编码器推荐
     if has_vt_hevc:
         default_encoder = "hevc_videotoolbox"
     elif has_vt_h264:
         default_encoder = "h264_videotoolbox"
+    elif has_rk_hevc:
+        default_encoder = "hevc_rkmpp"
+    elif has_rk_h264:
+        default_encoder = "h264_rkmpp"
     else:
         default_encoder = "libx264"
 
@@ -1808,7 +1896,7 @@ def main():
     # 编码与性能参数
     encode_group = parser.add_argument_group("编码器与画质设置")
     encode_group.add_argument("--encoder", type=str, default=default_encoder,
-                              choices=["hevc_videotoolbox", "h264_videotoolbox", "libx264", "libx265"],
+                              choices=["hevc_videotoolbox", "h264_videotoolbox", "hevc_rkmpp", "h264_rkmpp", "libx264", "libx265"],
                               help=f"视频编码器 (当前系统默认: {default_encoder})")
     encode_group.add_argument("--h264", action="store_true", help="优先使用 H.264 编码 (兼容老电视或老旧播放设备)")
     encode_group.add_argument("--cpu", action="store_true", help="强制使用 CPU 软件编码 (libx264 / libx265)")
@@ -1840,7 +1928,12 @@ def main():
     if args.cpu:
         encoder = "libx264" if args.h264 else "libx265"
     elif args.h264:
-        encoder = "h264_videotoolbox" if has_vt_h264 else "libx264"
+        if has_vt_h264:
+            encoder = "h264_videotoolbox"
+        elif has_rk_h264:
+            encoder = "h264_rkmpp"
+        else:
+            encoder = "libx264"
     else:
         encoder = args.encoder
 
@@ -1856,6 +1949,8 @@ def main():
         engine_desc = {
             "hevc_videotoolbox": "Apple VideoToolbox HEVC/H.265 GPU 硬件加速 (极速、体积小、画质高)",
             "h264_videotoolbox": "Apple VideoToolbox H.264 GPU 硬件加速 (极速、高兼容、低发热)",
+            "hevc_rkmpp": "Rockchip RKMPP HEVC/H.265 硬件极速加速 (VPU硬压、体积小、超高速)",
+            "h264_rkmpp": "Rockchip RKMPP H.264 硬件极速加速 (VPU硬压、高兼容、超高速)",
             "libx265": f"CPU 软件高效编码 libx265 (CRF: {args.crf}, Preset: {args.preset})",
             "libx264": f"CPU 软件标准编码 libx264 (CRF: {args.crf}, Preset: {args.preset})"
         }.get(encoder, f"{encoder} 编码引擎")

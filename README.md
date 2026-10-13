@@ -11,7 +11,7 @@
 1. **深度抢救修复**：专治各种损坏/未下载完全视频（如 `.part`、`.tmp`、元数据丢失、高坏帧率文件），自动突破 FFmpeg 限制修复封装与音视频同步。
 2. **极速硬件加速**：
    - macOS：全自动调用 Apple Silicon GPU（`hevc_videotoolbox` / `h264_videotoolbox`）。
-   - Linux / ARM：自动调度多核并行加速（`libx264` / `libx265`），视频体积立减 30% ~ 70%。
+   - Linux / ARM：原生支持 Rockchip 瑞芯微 RK3588/RK3568 VPU 硬件编解码加速（`hevc_rkmpp` / `h264_rkmpp`）及通用多核并行加速（`libx264` / `libx265`），视频体积立减 30% ~ 70%。
 3. **多分卷秒级合并 (`-M`)**：
    - 支持多 CD 分卷（如 `CD1.avi` `CD2.avi` 或 `Part1.mp4` `Part2.mp4`）极速无损流复制合并。
    - **0 重编码、0 损画质、秒级完成**；合并成功后可选自动清理原分卷 (`-d`)。
