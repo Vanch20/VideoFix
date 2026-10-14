@@ -20,6 +20,12 @@
    - 支持指定比例锁定（如短剧 `-a 9:16`、宽银幕电影 `-a 2.39:1`）。
 5. **智能防体积膨胀**：
    - 智能分析源片码率，若原片码率已在合理精简区间，自动转为极速重封装，严防转码后体积不降反增。
+6. **后台脱机运行与任务守护 (`-B` / `--status` / `--stop`)**：
+   - 支持一键转入系统后台脱机运行（双重 `fork` + `setsid` 守护模式），即刻释放终端，关闭终端窗口或断开 SSH 远程连接绝不中断任务。
+   - 支持一键状态查询（`--status`），随时调取任务 PID、已运行时长与最新实时日志动态。
+   - 支持一键安全终止（`--stop`），向进程组发送优雅中断信号，确保未转码完成的源文件严格受保护绝不误删，自动清理临时缓存。
+7. **全自动零配置日志审计 (100% 自动生成)**：
+   - 默认开启 100% 自动日志记录，单文件独立安装（如直接复制至 `/usr/local/bin/vfix`）亦自包含保障，记录所有处理过的文件 (`processed.log`) 与安全删除的文件 (`deleted.log`)。
 
 ---
 
@@ -45,6 +51,7 @@ cd VideoFix
 # 创建系统全局快捷命令
 sudo cp video_repair_compress.py /usr/local/bin/vfix
 sudo cp video_autocrop.py /usr/local/bin/video_autocrop.py
+sudo cp video_logger.py /usr/local/bin/video_logger.py
 sudo ln -sf /usr/local/bin/video_autocrop.py /usr/local/bin/vcrop
 sudo chmod +x /usr/local/bin/vfix /usr/local/bin/vcrop
 ```
@@ -54,33 +61,40 @@ sudo chmod +x /usr/local/bin/vfix /usr/local/bin/vcrop
 ## 📖 命令行帮助速查 (`vfix --help`)
 
 ```text
-用法: vfix [-h] [-o OUTPUT_DIR] [-d] [-r] [-M] [-m] [-y] [-c [CROP]]
-            [-a ASPECT] [-s] [-D] [--max-ad-duration MAX_AD_DURATION]
+用法: vfix [-h] [-o OUTPUT_DIR] [-d] [-r] [-B] [--status] [--stop] [-M] [-m]
+            [-y] [-c] [--crop W:H:X:Y] [-a ASPECT] [-s] [-D]
+            [--max-ad-duration MAX_AD_DURATION]
             [--min-segment-duration MIN_SEGMENT_DURATION] [--crf CRF]
             [--preset {ultrafast,superfast,veryfast,faster,fast,medium,slow}]
             [--threshold THRESHOLD]
-            [--encoder {hevc_videotoolbox,h264_videotoolbox,libx264,libx265}]
+            [--encoder {hevc_videotoolbox,h264_videotoolbox,hevc_rkmpp,h264_rkmpp,libx264,libx265}]
             [--h264] [--cpu] [--force-compress] [--force-repair-only]
-            inputs [inputs ...]
+            [--log-dir LOG_DIR] [--no-log]
+            [inputs ...]
 ```
 
 ### 常用选项说明
 
 | 参数 | 说明 |
 | :--- | :--- |
+| **`-B, --background`** | **【后台运行】** 将任务转入后台脱机执行（即刻释放终端，终端关闭或网络中断不影响执行） |
+| **`--status`** | **【状态查询】** 查看当前后台任务运行状态、PID、已运行时间与最新 15 行实时日志 |
+| **`--stop`** | **【安全终止】** 安全优雅停止当前后台任务（未完成转码的源文件严格受保护，绝不删除） |
 | `-o, --output-dir` | 指定输出目录或输出文件名（如 `-o /mnt/nas/` 或 `-o full_movie.mp4`） |
-| `-d, --delete-source` | 处理成功后自动删除源文件（失败或中断时严密保护不删除） |
+| `-d, --delete-source` | 处理或合并成功后自动删除源文件（失败、中断或截断异常时熔断保护绝对不删除） |
 | `-r, --recursive` | 递归扫描并处理指定目录及其下所有子目录中的视频 |
 | **`-M, --merge-only`** | **【合并强烈推荐】** 无损极速流复制合并多个分卷（0 重编码、秒级完成） |
 | `-m, --merge` | 合并多个分卷并重新压制瘦身（若各分卷分辨率/码率不一时自动对齐重编码） |
-| `-y, --yes` | 合并前跳过交互式分卷顺序确认提示，直接开始处理 |
-| `-c, --crop` | 智能去除视频黑边（自动识别并剔除字幕广告干扰；亦可指定尺寸） |
+| `-y, --yes` | 合并前跳过交互式分卷顺序确认提示，直接开始处理（后台模式下自动启用） |
+| `-c, --autocrop` | 智能去除视频黑边（自动识别并剔除字幕广告干扰；亦可指定尺寸） |
 | `-a, --aspect` | 锁定目标画幅比例居中裁剪（如 `9:16`, `16:9`, `2.39:1`） |
 | `-s, --split-scenes` | 智能场景切片模式（按横竖屏切换时间点自动分段导出） |
 | `-D, --drop-ads` | 自动检测并剔除短剧广告/插片分段（仅保留正片） |
 | `--crf` | 恒定画质系数（默认 22；18~24 为黄金画质平衡区间） |
 | `--h264` | 指定输出为 H.264 编码（最大化兼容老旧电视或播放器） |
 | `--force-repair-only` | 仅修复封装结构损坏与音视频同步，不重新编码 |
+| `--log-dir <DIR>` | 自定义运行与删除日志保存目录（默认全自动记录至：`~/.vfix/logs/`） |
+| `--no-log` | 禁用所有执行与删除日志记录 |
 
 ---
 
@@ -123,6 +137,50 @@ vfix /mnt/nas/videos/ -r -o /mnt/nas/compressed/
 ```bash
 # 针对仅有容器索引损坏、播放拖动卡顿的视频进行瞬时修复
 vfix broken_index.mp4 --force-repair-only
+```
+
+### 6. 后台脱机批量运行与任务守护 (大批量/长耗时必备)
+```bash
+# 后台批量处理整个 NAS 视频目录并删除原片，终端即刻释放，可安心断开 SSH
+vfix /mnt/nas/videos/ -r -d -B
+
+# 随时查看后台任务运行状态、处理进度与最新日志
+vfix --status
+
+# 实时流式监控处理日志
+tail -f ~/.vfix/logs/vfix.log
+
+# 如需提前终止，使用 --stop 优雅停止 (严格保护源文件，清理临时缓存)
+vfix --stop
+```
+
+---
+
+## 📝 审计日志与对账记录 (Logging System)
+
+`vfix` 与 `vcrop` 内置了线程安全、开箱即用的自动化日志系统，无须任何额外配置。
+
+默认所有日志保存在用户家目录：`~/.vfix/logs/`：
+
+1. **`processed.log`（处理记录台账）**：
+   - 记录所有执行处理的视频文件详细情况：
+   - 记录输入路径、输出路径、原视频画幅与码率、转码前后体积对比（精确至字节并展示瘦身百分比）、实际耗时、处理模式（如 `COMPRESS`, `MERGE_ONLY`, `AUTOCROP`, `SPLIT_SCENES` 等）以及处理状态（`SUCCESS`, `SKIPPED`, `FAILED`）。
+2. **`deleted.log`（删除文件审计日志）**：
+   - 专为 `-d / --delete-source` 打造的安全审计台账。
+   - 无论合并清理旧分卷，还是转码瘦身后清理原片，每一次删除操作均记录：精确时间戳、被删除文件的绝对路径、删除前真实大小、触发原因以及替换该文件的目标产物绝对路径。
+3. **`vfix.log` / `vcrop.log`（综合运行日志）**：
+   - 记录每次命令执行会话（Session）的开始/结束边界、命令行原始参数、吞吐统计与异常报错堆栈。
+
+### 自定义与禁用日志
+```bash
+# 自定义日志保存目录 (例如写入挂载盘或项目专用目录)
+vfix input.mp4 -d --log-dir /path/to/my_logs/
+
+# 也可以通过环境变量指定
+export VFIX_LOG_DIR="/mnt/nas/vfix_logs"
+
+# 临时完全禁用日志记录
+vfix input.mp4 --no-log
 ```
 
 ---

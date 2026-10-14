@@ -73,6 +73,502 @@ except ImportError:
         detect_scene_segments = None
         process_video_with_splits = None
 
+import atexit
+import signal
+from datetime import datetime
+
+# ==============================================================================
+# 自包含通用日志记录与后台守护引擎 (100% 自动生成，单文件独立运行无任何外部依赖)
+# ==============================================================================
+class _EmbeddedVideoLogger:
+    """自包含线程安全日志记录引擎 (保证脚本独立复制为 /usr/local/bin/vfix 时日志 100% 自动记录)"""
+    DEFAULT_LOG_DIR = Path.home() / ".vfix" / "logs"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._current_log_dir = self.DEFAULT_LOG_DIR
+        self._enabled = True
+        self._tool_name = "vfix"
+
+    def format_bytes(self, size_bytes: Union[int, float]) -> str:
+        try:
+            size = float(size_bytes)
+        except (ValueError, TypeError):
+            return "0 B"
+        if size < 0:
+            return "0 B"
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.2f} {unit}" if unit in ("MB", "GB", "TB") else f"{size:.0f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} TB"
+
+    def format_bitrate(self, bps: Union[int, float]) -> str:
+        try:
+            val = float(bps)
+        except (ValueError, TypeError):
+            return "未知码率"
+        if val <= 0:
+            return "未知码率"
+        if val >= 1_000_000:
+            return f"{val / 1_000_000:.2f} Mbps"
+        return f"{val / 1000:.0f} kbps"
+
+    def get_log_dir(self) -> Path:
+        env_dir = os.environ.get("VFIX_LOG_DIR")
+        if env_dir:
+            return Path(env_dir).expanduser().resolve()
+        return self._current_log_dir
+
+    def setup_logger(self, log_dir: Optional[Union[str, Path]] = None, enabled: bool = True, tool_name: str = "vfix") -> Path:
+        self._enabled = enabled
+        self._tool_name = tool_name
+        if log_dir:
+            self._current_log_dir = Path(log_dir).expanduser().resolve()
+        else:
+            env_dir = os.environ.get("VFIX_LOG_DIR")
+            if env_dir:
+                self._current_log_dir = Path(env_dir).expanduser().resolve()
+            else:
+                self._current_log_dir = self.DEFAULT_LOG_DIR
+        if self._enabled:
+            try:
+                self._current_log_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        return self._current_log_dir
+
+    def _append(self, file_path: Path, text: str) -> bool:
+        if not self._enabled:
+            return False
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                with open(file_path, "a", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+            return True
+        except Exception:
+            return False
+
+    def get_processed_log_path(self) -> Path:
+        return self.get_log_dir() / "processed.log"
+
+    def get_deleted_log_path(self) -> Path:
+        return self.get_log_dir() / "deleted.log"
+
+    def get_main_log_path(self) -> Path:
+        return self.get_log_dir() / f"{self._tool_name}.log"
+
+    def log_processed(
+        self,
+        input_file: Union[str, Path, List[Union[str, Path]]],
+        output_target: Optional[Union[str, Path]],
+        status: str,
+        action: str = "PROCESS",
+        orig_size: Optional[Union[int, float]] = None,
+        new_size: Optional[Union[int, float]] = None,
+        elapsed_sec: Optional[float] = None,
+        orig_info: Optional[Dict[str, Any]] = None,
+        output_info: Optional[Dict[str, Any]] = None,
+        details: Optional[str] = None,
+        tool: Optional[str] = None
+    ) -> None:
+        if not self._enabled:
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tool_label = tool or self._tool_name
+        if isinstance(input_file, (list, tuple)):
+            input_count = len(input_file)
+            first_path = str(Path(input_file[0]).resolve())
+            input_desc = f"{first_path} (等共 {input_count} 个分卷)" if input_count > 1 else first_path
+        else:
+            input_desc = str(Path(input_file).resolve())
+        out_desc = str(Path(output_target).resolve()) if output_target else "None"
+        size_str = ""
+        if orig_size is not None and orig_size >= 0:
+            size_str = self.format_bytes(orig_size)
+            if new_size is not None and new_size >= 0:
+                change_pct = ((new_size - orig_size) / orig_size * 100) if orig_size > 0 else 0
+                saved_bytes = orig_size - new_size
+                saved_str = f", 节省 {self.format_bytes(saved_bytes)}" if saved_bytes > 0 else (f", 增加 {self.format_bytes(-saved_bytes)}" if saved_bytes < 0 else "")
+                size_str = f"{self.format_bytes(orig_size)} -> {self.format_bytes(new_size)} ({change_pct:+.1f}%{saved_str})"
+        cost_str = f"{elapsed_sec:.1f}s" if elapsed_sec is not None else "未知"
+        media_specs = []
+        if orig_info:
+            w = orig_info.get("width")
+            h = orig_info.get("height")
+            fps = orig_info.get("fps")
+            codec = orig_info.get("codec")
+            br = orig_info.get("bitrate") or orig_info.get("video_bitrate")
+            if w and h:
+                spec = f"{w}x{h}"
+                if fps:
+                    spec += f" @ {fps:.1f}fps"
+                media_specs.append(spec)
+            if codec and codec != "unknown":
+                media_specs.append(str(codec))
+            if br and float(br) > 0:
+                media_specs.append(self.format_bitrate(float(br)))
+        media_str = f" | {', '.join(media_specs)}" if media_specs else ""
+        lines = [
+            f"[{now_str}] [{tool_label}] [{status.upper()}] [{action.upper()}] - {input_desc}",
+            f"  * 输入: {input_desc}{media_str}",
+            f"  * 输出: {out_desc}",
+            f"  * 体积: {size_str} | 耗时: {cost_str}"
+        ]
+        if details:
+            lines.append(f"  * 详情: {details.strip()}")
+        lines.append("")
+        self._append(self.get_processed_log_path(), "\n".join(lines) + "\n")
+        main_line = f"{now_str} [{status.upper()}] [{tool_label}:{action.upper()}] {input_desc} -> {out_desc} ({size_str}, 耗时 {cost_str})"
+        if details:
+            main_line += f" | {details.strip()}"
+        self._append(self.get_main_log_path(), main_line + "\n")
+
+    def log_deleted(
+        self,
+        deleted_file: Union[str, Path],
+        size_bytes: Optional[Union[int, float]] = None,
+        reason: str = "源文件清理 (--delete-source)",
+        target_path: Optional[Union[str, Path]] = None,
+        status: str = "DELETED",
+        error_msg: Optional[str] = None,
+        tool: Optional[str] = None
+    ) -> None:
+        if not self._enabled:
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tool_label = tool or self._tool_name
+        try:
+            del_path = str(Path(deleted_file).resolve())
+        except Exception:
+            del_path = str(deleted_file)
+        target_str = str(Path(target_path).resolve()) if target_path else "None"
+        size_str = self.format_bytes(size_bytes) if size_bytes is not None else "未知大小"
+        raw_size_str = f" ({int(size_bytes):,} 字节)" if size_bytes is not None and size_bytes > 0 else ""
+        lines = [
+            f"[{now_str}] [{tool_label}] [{status.upper()}] {del_path} ({size_str})",
+            f"  * 路径: {del_path}",
+            f"  * 大小: {size_str}{raw_size_str}",
+            f"  * 原因: {reason.strip()}",
+            f"  * 对应产物: {target_str}"
+        ]
+        if error_msg:
+            lines.append(f"  * 失败原因: {error_msg.strip()}")
+        lines.append("")
+        self._append(self.get_deleted_log_path(), "\n".join(lines) + "\n")
+        main_line = f"{now_str} [{status.upper()}] [{tool_label}:CLEANUP] 已删除源文件: {del_path} ({size_str}) | 原因: {reason.strip()}"
+        if error_msg:
+            main_line += f" | 错误: {error_msg.strip()}"
+        self._append(self.get_main_log_path(), main_line + "\n")
+
+    def log_event(self, level: str, message: str, tool: Optional[str] = None) -> None:
+        if not self._enabled:
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tool_label = tool or self._tool_name
+        line = f"{now_str} [{level.upper():5s}] [{tool_label}] {message}\n"
+        self._append(self.get_main_log_path(), line)
+
+    def log_session_start(self, args: List[str], file_count: int, tool: Optional[str] = None) -> None:
+        tool_label = tool or self._tool_name
+        cmd_str = " ".join(args)
+        self.log_event("INFO", f"========== 开始任务会话: {tool_label} (待处理文件: {file_count} 个) ==========", tool=tool_label)
+        self.log_event("INFO", f"执行参数: {cmd_str}", tool=tool_label)
+
+    def log_session_end(self, success_count: int, fail_count: int, total_cost: float, tool: Optional[str] = None) -> None:
+        tool_label = tool or self._tool_name
+        self.log_event("INFO", f"========== 会话结束: 成功 {success_count} 个, 失败 {fail_count} 个, 总耗时 {total_cost:.1f}s ==========", tool=tool_label)
+
+
+class _EmbeddedDaemonManager:
+    """自包含通用后台守护进程管理器，支持脱机运行、状态查询与安全停止。"""
+
+    def __init__(
+        self,
+        tool_name: str,
+        base_dir: Optional[Path] = None,
+        log_file: Optional[Path] = None
+    ):
+        self.tool_name = tool_name
+        self.base_dir = Path(base_dir).expanduser().resolve() if base_dir else (Path.home() / ".vfix")
+        self.pid_file = self.base_dir / f"{tool_name}.pid"
+        self.log_file = Path(log_file).expanduser().resolve() if log_file else (self.base_dir / "logs" / f"{tool_name}.log")
+
+    def is_pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as err:
+            return err.errno == errno.EPERM
+
+    def get_running_info(self) -> Optional[Dict[str, Any]]:
+        if not self.pid_file.exists():
+            return None
+        try:
+            with open(self.pid_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pid = data.get("pid")
+            if pid and self.is_pid_alive(pid):
+                return data
+            try:
+                self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return None
+
+    def show_status(self) -> None:
+        info = self.get_running_info()
+        print("=" * 72)
+        if info:
+            pid = info["pid"]
+            start_time = info.get("start_time", 0)
+            elapsed = time.time() - start_time if start_time else 0
+            m, s = divmod(int(elapsed), 60)
+            h, m = divmod(m, 60)
+            elapsed_str = f"{h}小时{m}分{s}秒" if h > 0 else (f"{m}分{s}秒" if m > 0 else f"{s}秒")
+
+            print(f"[后台任务状态] 运行中 (RUNNING)")
+            print(f"  * 模块工具: {self.tool_name}")
+            print(f"  * 进程 PID: {pid}")
+            print(f"  * 启动时间: {info.get('start_time_str', '未知')} (已运行: {elapsed_str})")
+            print(f"  * 任务总量: {info.get('file_count', '未知')} 个视频文件")
+            if info.get("args"):
+                print(f"  * 运行指令: {' '.join(info['args'])}")
+            print(f"  * 运行主日志: {self.log_file}")
+            print(f"  * 实时跟踪: tail -f {self.log_file}")
+            print(f"  * 停止命令: {self.tool_name} --stop")
+        else:
+            print(f"[后台任务状态] 当前没有正在运行的 {self.tool_name} 后台任务。")
+            if self.log_file.exists():
+                print(f"  * 历史运行日志: {self.log_file}")
+
+        if self.log_file.exists():
+            print("-" * 72)
+            print(f"[最新日志动态 (最后 15 行)]: {self.log_file}")
+            try:
+                with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
+                    lines = deque(f, maxlen=15)
+                for line in lines:
+                    sys.stdout.write(f"  {line}")
+                if lines and not lines[-1].endswith("\n"):
+                    sys.stdout.write("\n")
+            except Exception as e:
+                print(f"  [读取日志失败: {e}]")
+        print("=" * 72)
+
+    def stop_daemon(self) -> bool:
+        if not self.pid_file.exists():
+            print(f"[提示] 未找到 {self.tool_name} 的后台任务锁文件，当前没有运行中的后台任务。")
+            return True
+        try:
+            with open(self.pid_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pid = data.get("pid")
+        except Exception:
+            pid = None
+
+        if not pid or not self.is_pid_alive(pid):
+            try:
+                self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            print(f"[提示] 进程 {pid if pid else ''} 已不在运行，已清理残留的任务状态。")
+            return True
+
+        print(f"[正在停止] 发现正在运行的 {self.tool_name} 后台任务 (PID: {pid})，正在安全停止...")
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+        for _ in range(25):
+            time.sleep(0.2)
+            if not self.is_pid_alive(pid):
+                break
+        else:
+            print(f"[强制终止] 任务未在限定时间内响应 SIGTERM，发送 SIGKILL 强制终止...")
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+        try:
+            self.pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        print(f"[完成] 后台任务 (PID: {pid}) 已成功停止。")
+        print(f"  * 安全保障: 未完成转码的源文件已严格保护，绝不删除。")
+        print(f"  * 日志记录: 详见 {self.log_file}")
+        return True
+
+    def daemonize(self, file_count: int, raw_argv: List[str]) -> None:
+        info = self.get_running_info()
+        if info:
+            pid = info["pid"]
+            print(f"[错误] 检测到已有 {self.tool_name} 后台任务正在运行 (PID: {pid})！")
+            print(f"  * 启动时间: {info.get('start_time_str', '未知')}")
+            print(f"  * 实时日志: tail -f {self.log_file}")
+            print(f"  * 状态查询: {self.tool_name} --status")
+            print(f"  * 若需强制终止现有任务，请执行: {self.tool_name} --stop")
+            sys.exit(1)
+
+        if not hasattr(os, "fork"):
+            print("[警告] 当前操作系统不支持 Unix fork 守护进程脱离，将直接在前台运行。")
+            return
+
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        r, w = os.pipe()
+
+        # 第一次 fork
+        try:
+            pid1 = os.fork()
+            if pid1 > 0:
+                os.close(w)
+                try:
+                    resp = os.read(r, 1024).decode("utf-8")
+                    grandchild_pid = int(resp.strip()) if resp.strip().isdigit() else None
+                except Exception:
+                    grandchild_pid = None
+                finally:
+                    os.close(r)
+                os.waitpid(pid1, 0)
+
+                print("=" * 72)
+                print(f"[后台运行] 任务已成功转入后台脱机运行！")
+                if grandchild_pid:
+                    print(f"  * 后台进程 PID: {grandchild_pid}")
+                print(f"  * 待处理视频数量: {file_count} 个")
+                print(f"  * 实时日志追踪: tail -f {self.log_file}")
+                print(f"  * 查看任务状态: {self.tool_name} --status")
+                print(f"  * 终止后台任务: {self.tool_name} --stop")
+                print("=" * 72)
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write(f"[错误] 第一次 fork 失败: {e}\n")
+            sys.exit(1)
+
+        # 子进程 1
+        os.close(r)
+        os.setsid()
+
+        # 第二次 fork
+        try:
+            pid2 = os.fork()
+            if pid2 > 0:
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write(f"[错误] 第二次 fork 失败: {e}\n")
+            sys.exit(1)
+
+        # 孙进程 (真正的守护进程)
+        try:
+            os.setpgrp()
+        except Exception:
+            pass
+
+        daemon_pid = os.getpid()
+
+        now = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pid_data = {
+            "pid": daemon_pid,
+            "start_time": now,
+            "start_time_str": now_str,
+            "tool": self.tool_name,
+            "args": raw_argv,
+            "file_count": file_count,
+            "log_file": str(self.log_file.resolve())
+        }
+        try:
+            with open(self.pid_file, "w", encoding="utf-8") as f:
+                json.dump(pid_data, f, indent=2)
+        except Exception as e:
+            sys.stderr.write(f"[警告] 写入 PID 文件失败: {e}\n")
+
+        try:
+            os.write(w, str(daemon_pid).encode("utf-8"))
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(w)
+            except Exception:
+                pass
+
+        try:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.close(devnull)
+
+            log_fd = os.open(str(self.log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+            os.close(log_fd)
+            try:
+                sys.stdout.reconfigure(line_buffering=True)
+                sys.stderr.reconfigure(line_buffering=True)
+            except Exception:
+                pass
+        except Exception as e:
+            sys.stderr.write(f"[警告] 重定向 I/O 失败: {e}\n")
+
+        def cleanup_pid():
+            try:
+                if self.pid_file.exists():
+                    self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        atexit.register(cleanup_pid)
+
+        def sig_handler(signum, frame):
+            cleanup_pid()
+            sys.exit(143)
+
+        try:
+            signal.signal(signal.SIGTERM, sig_handler)
+            signal.signal(signal.SIGHUP, sig_handler)
+        except Exception:
+            pass
+
+
+# 通用日志记录模块与守护进程控制 (优先使用外部模块，缺失时平滑使用内置引擎)
+try:
+    import video_logger as vlog
+    DaemonManager = getattr(vlog, "DaemonManager", _EmbeddedDaemonManager)
+except ImportError:
+    _vfix_dir = Path(__file__).resolve().parent
+    if str(_vfix_dir) not in sys.path:
+        sys.path.insert(0, str(_vfix_dir))
+    try:
+        import video_logger as vlog
+        DaemonManager = getattr(vlog, "DaemonManager", _EmbeddedDaemonManager)
+    except ImportError:
+        vlog = _EmbeddedVideoLogger()
+        DaemonManager = _EmbeddedDaemonManager
+
+if not hasattr(vlog, "setup_logger"):
+    vlog = _EmbeddedVideoLogger()
+if DaemonManager is None:
+    DaemonManager = _EmbeddedDaemonManager
+
 # 常见流媒体及光盘视频格式后缀
 BASE_VIDEO_EXTENSIONS = [
     ".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv",
@@ -1106,8 +1602,34 @@ def should_compress(
     )
 
 
+CURRENT_ACTIVE_PROCESS: Optional[subprocess.Popen] = None
+
+
+def setup_signal_handlers():
+    """注册进程信号处理，确保被 SIGTERM/SIGHUP 终止时妥善清理子进程 FFmpeg"""
+    def handle_termination(signum, frame):
+        global CURRENT_ACTIVE_PROCESS
+        if CURRENT_ACTIVE_PROCESS:
+            try:
+                CURRENT_ACTIVE_PROCESS.terminate()
+                CURRENT_ACTIVE_PROCESS.wait(timeout=2)
+            except Exception:
+                try:
+                    CURRENT_ACTIVE_PROCESS.kill()
+                except Exception:
+                    pass
+        sys.exit(143)
+
+    try:
+        signal.signal(signal.SIGTERM, handle_termination)
+        signal.signal(signal.SIGHUP, handle_termination)
+    except Exception:
+        pass
+
+
 def execute_ffmpeg(cmd: List[str]) -> Tuple[bool, str]:
     """执行 ffmpeg 命令，实时显示进度并通过后台线程持续排空 stderr，防止坏帧日志塞满管道缓冲区导致进程卡死死锁。"""
+    global CURRENT_ACTIVE_PROCESS
     full_cmd = [cmd[0]] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
     try:
         proc = subprocess.Popen(
@@ -1117,6 +1639,7 @@ def execute_ffmpeg(cmd: List[str]) -> Tuple[bool, str]:
             text=True,
             bufsize=1
         )
+        CURRENT_ACTIVE_PROCESS = proc
 
         last_stderr_lines = deque(maxlen=40)
 
@@ -1133,6 +1656,8 @@ def execute_ffmpeg(cmd: List[str]) -> Tuple[bool, str]:
         last_time = ""
         last_speed = ""
         last_fps = ""
+        last_progress_print_time = 0.0
+        is_tty = sys.stdout.isatty()
 
         for line in proc.stdout:
             line = line.strip()
@@ -1144,15 +1669,23 @@ def execute_ffmpeg(cmd: List[str]) -> Tuple[bool, str]:
                 last_fps = line.split("=")[1].strip()
             elif line.startswith("progress="):
                 if last_time:
-                    info_str = f"\r  [处理进度] 已编码时间: {last_time} | 速度: {last_speed} | 帧率: {last_fps} fps"
-                    sys.stdout.write(info_str)
-                    sys.stdout.flush()
+                    cur_time = time.time()
+                    if is_tty:
+                        info_str = f"\r  [处理进度] 已编码时间: {last_time} | 速度: {last_speed} | 帧率: {last_fps} fps"
+                        sys.stdout.write(info_str)
+                        sys.stdout.flush()
+                    else:
+                        if cur_time - last_progress_print_time >= 4.0:
+                            sys.stdout.write(f"  [处理进度] 已编码时间: {last_time} | 速度: {last_speed} | 帧率: {last_fps} fps\n")
+                            sys.stdout.flush()
+                            last_progress_print_time = cur_time
 
         proc.wait()
         stderr_thread.join(timeout=2.0)
 
         if last_time:
-            sys.stdout.write("\n")
+            if is_tty:
+                sys.stdout.write("\n")
             sys.stdout.flush()
 
         if proc.returncode != 0:
@@ -1173,14 +1706,51 @@ def execute_ffmpeg(cmd: List[str]) -> Tuple[bool, str]:
         raise
     except Exception as e:
         return False, str(e)
+    finally:
+        CURRENT_ACTIVE_PROCESS = None
 
 
-def remove_source_files(sources: List[Path], final_output: Path) -> None:
-    """在视频处理或合并成功后安全删除源文件（严格校验，绝不误删最终输出）。"""
+def remove_source_files(
+    sources: List[Path],
+    final_output: Path,
+    reason: str = "源文件清理 (--delete-source)",
+    tool: str = "vfix"
+) -> None:
+    """
+    在视频处理或合并成功后安全删除源文件（具有最严密的安全熔断保护机制）：
+    1. 校验目标文件是否存在且大小正常；
+    2. 探测目标文件是否包含有效视频流；
+    3. 比对源文件与目标文件的时长，若目标文件时长缩水超过 6% 且少于 4 秒，绝对禁止删除并发出致命拦截警告；
+    4. 比对体积异常暴跌，防止截断残废文件误删源文件；
+    5. 记录完整审计日志至 deleted.log。
+    """
     try:
         final_res = final_output.resolve()
     except Exception:
         final_res = None
+
+    is_dir_output = False
+    if final_output.is_dir():
+        is_dir_output = True
+        sub_videos = [f for f in final_output.glob("*") if f.is_file() and f.stat().st_size > 0]
+        if not sub_videos:
+            print(f"  * [安全熔断拦截] 切片目录为空或无有效分段视频 ({final_output})，绝对禁止删除源文件！", file=sys.stderr)
+            return
+        out_dur = 0.0
+        out_size = sum(f.stat().st_size for f in sub_videos)
+    else:
+        if not final_output.exists() or final_output.stat().st_size <= 0:
+            print(f"  * [安全熔断拦截] 目标输出文件不存在或为空 ({final_output.name})，绝对禁止删除源文件！", file=sys.stderr)
+            return
+
+        # 深度前置探针：验证目标产物的有效性
+        out_info = probe_video(final_output)
+        if not out_info or not out_info.get("width"):
+            print(f"  * [安全熔断拦截] 目标输出文件无有效视频画面流 ({final_output.name})，绝对禁止删除源文件！", file=sys.stderr)
+            return
+
+        out_dur = out_info.get("duration", 0.0)
+        out_size = final_output.stat().st_size
 
     for s in sources:
         try:
@@ -1190,9 +1760,72 @@ def remove_source_files(sources: List[Path], final_output: Path) -> None:
             if final_res is not None and s_res == final_res:
                 print(f"  * [源文件清理跳过] 源文件与输出文件路径相同，已保护: {s.name}")
                 continue
+
+            s_size = s.stat().st_size
+
+            # 核心安全守门员：源文件与输出文件的时长严格核验
+            s_info = probe_video(s)
+            s_dur = s_info.get("duration", 0.0) if s_info else 0.0
+
+            # 若源文件探测到了有效时长且大于 15 秒
+            if s_dur > 15.0 and out_dur > 0.0:
+                # 若产物时长比源视频短超过 6% 且缺失超过 4 秒
+                if out_dur < (s_dur * 0.94) and (s_dur - out_dur) > 4.0:
+                    err_msg = (
+                        f"产物时长严重截断！源视频时长 {s_dur:.1f}s ({s_dur/60:.1f}m)，"
+                        f"产物仅 {out_dur:.1f}s ({out_dur/60:.1f}m) "
+                        f"(丢失 {(s_dur - out_dur):.1f}s, 缺失率 {((s_dur - out_dur) / s_dur * 100):.1f}%)"
+                    )
+                    print(f"  * [致命安全拦截] {err_msg}！绝对禁止删除源文件: {s.name}", file=sys.stderr)
+                    if vlog:
+                        vlog.log_deleted(
+                            deleted_file=s,
+                            size_bytes=s_size,
+                            reason=f"安全拦截阻止删除: {err_msg}",
+                            target_path=final_output,
+                            status="BLOCKED_PROTECTED",
+                            tool=tool
+                        )
+                    continue
+
+            # 体积异常暴跌熔断保护：如原文件 700MB，产物只有 4MB (-99.5%)
+            if s_size > 20 * 1024 * 1024 and out_size < (s_size * 0.10) and (s_dur > 30.0 or s_size > 50 * 1024 * 1024):
+                if out_dur < (s_dur * 0.90) if s_dur > 0 else True:
+                    err_msg = f"产物体积异常暴跌 ({format_bytes(out_size)} vs 原文件 {format_bytes(s_size)}, 降幅超 90%) 且时长存疑"
+                    print(f"  * [致命安全拦截] {err_msg}！疑似破损截断残片，绝对禁止删除源文件: {s.name}", file=sys.stderr)
+                    if vlog:
+                        vlog.log_deleted(
+                            deleted_file=s,
+                            size_bytes=s_size,
+                            reason=f"安全拦截阻止删除: {err_msg}",
+                            target_path=final_output,
+                            status="BLOCKED_PROTECTED",
+                            tool=tool
+                        )
+                    continue
+
             s.unlink()
-            print(f"  * [源文件清理] 已安全删除源文件: {s.name}")
+            if vlog:
+                vlog.log_deleted(
+                    deleted_file=s,
+                    size_bytes=s_size,
+                    reason=reason,
+                    target_path=final_output,
+                    status="DELETED",
+                    tool=tool
+                )
+            print(f"  * [源文件清理] 已安全删除源文件: {s.name} ({format_bytes(s_size)}, 已记录至 deleted.log)")
         except Exception as e:
+            if vlog:
+                vlog.log_deleted(
+                    deleted_file=s,
+                    size_bytes=0,
+                    reason=reason,
+                    target_path=final_output,
+                    status="DELETE_FAILED",
+                    error_msg=str(e),
+                    tool=tool
+                )
             print(f"  * [警告] 删除源文件失败 ({s.name}): {e}", file=sys.stderr)
 
 
@@ -1408,18 +2041,34 @@ def process_video(
     if not need_compress and not force_repair_only:
         print(f"  * 提示: 该文件已处于工业级高兼容或高能效状态，若执意强制重新编码压制可添加参数: --force-compress")
 
-    target_dir = output_dir if output_dir else file_path.parent
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    clean_stem = get_clean_stem(file_path)
-    action_tag = "compressed" if need_compress else "repaired"
-    output_name = f"{clean_stem}_{action_tag}.mp4"
-    final_output_file = target_dir / output_name
+    if output_dir:
+        # 兼容用户传递的是目录，还是直接指定了输出目标文件名
+        if output_dir.is_dir() or str(output_dir).endswith(("/", "\\")) or not output_dir.suffix:
+            target_dir = output_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            clean_stem = get_clean_stem(file_path)
+            action_tag = "compressed" if need_compress else "repaired"
+            output_name = f"{clean_stem}_{action_tag}.mp4"
+            final_output_file = target_dir / output_name
+        else:
+            target_dir = output_dir.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            final_output_file = output_dir
+            output_name = final_output_file.name
+    else:
+        target_dir = file_path.parent
+        clean_stem = get_clean_stem(file_path)
+        action_tag = "compressed" if need_compress else "repaired"
+        output_name = f"{clean_stem}_{action_tag}.mp4"
+        final_output_file = target_dir / output_name
 
     # 避免输入输出路径完全相同覆盖原文件
-    if final_output_file.resolve() == file_path.resolve():
-        output_name = f"{file_path.stem}_crop.mp4" if crop_applied else f"{file_path.stem}_fixed.mp4"
-        final_output_file = target_dir / output_name
+    try:
+        if final_output_file.resolve() == file_path.resolve():
+            output_name = f"{file_path.stem}_crop.mp4" if crop_applied else f"{file_path.stem}_fixed.mp4"
+            final_output_file = target_dir / output_name
+    except Exception:
+        pass
 
     # 使用本地 SSD /tmp 目录作为临时输出缓冲：
     # 彻底杜绝 SMB 局域网网络盘在 -movflags +faststart 时产生的高延迟与 I/O 卡死
@@ -1595,27 +2244,6 @@ def process_video(
             ]
             success, last_err_msg = execute_ffmpeg(cmd_compress)
 
-            # 硬件编码器遇到不支持的特殊分辨率或破损包时，自动平滑切换至 CPU 软件容错编码
-            if not success and is_hardware:
-                print("  [提示] 硬件加速不支持该特殊分辨率规格或遇破损异常，自动平滑切换至 CPU 软件容错编码优化...")
-                fallback_video_args = build_video_encode_args(
-                    encoder="libx264",
-                    target_bps=target_bps,
-                    orig_v_bitrate=orig_v_bitrate,
-                    crf=crf,
-                    preset=preset,
-                    gop_size=gop_size,
-                    keyint_min=keyint_min,
-                    width=target_w,
-                    height=target_h
-                )
-                cmd_sw_fallback = sw_base_args + map_args + vf_fix_args + fallback_video_args + audio_args + [
-                    "-avoid_negative_ts", "make_zero",
-                    "-movflags", "+faststart",
-                    str(temp_output_file)
-                ]
-                success, last_err_msg = execute_ffmpeg(cmd_sw_fallback)
-
             # 仅当音频为 copy 且异常报错时，才兜底退回 aac 转码
             if not success and audio_mode == "copy":
                 cmd_compress_fallback = base_args + map_args + vf_fix_args + video_encode_args + [
@@ -1627,6 +2255,82 @@ def process_video(
                 success, last_err_msg = execute_ffmpeg(cmd_compress_fallback)
 
         duration_sec = time.time() - t_start
+
+        # === 核心安全防线：全方位产物完整性与时长截断核验 ===
+        is_truncated = False
+        out_probe = None
+        if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+            out_probe = probe_video(temp_output_file)
+            if not out_probe or not out_probe.get("width"):
+                success = False
+                last_err_msg = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
+            else:
+                out_dur = out_probe.get("duration", 0.0)
+                ref_dur = duration
+                if ref_dur <= 0.0 and orig_bitrate > 0:
+                    ref_dur = (orig_size * 8.0) / orig_bitrate
+
+                if ref_dur > 15.0 and out_dur > 0.0:
+                    if out_dur < (ref_dur * 0.94) and (ref_dur - out_dur) > 4.0:
+                        is_truncated = True
+                        last_err_msg = (
+                            f"产物严重过早截断！源时长: {ref_dur:.1f}s ({ref_dur/60:.1f}m)，"
+                            f"转码产物仅: {out_dur:.1f}s ({out_dur/60:.1f}m)，"
+                            f"丢失时长: {(ref_dur - out_dur):.1f}s (缺失率: {((ref_dur - out_dur) / ref_dur * 100):.1f}%)"
+                        )
+
+        # 硬件加速（如 RKMPP / VideoToolbox）若遇特殊编码/损坏包出现报错或意外提前截断，自动平滑切换至 CPU 软件强力容错编码
+        if (not success or is_truncated) and is_hardware:
+            if is_truncated:
+                print(f"  [严重警告] 硬件加速器 ({encoder}) 发生意外截断退出！\n    * {last_err_msg}\n    * 正在丢弃残片，并立即自动启动 CPU 软件强力容错编码 (libx264) 重新压制...")
+            else:
+                print("  [提示] 硬件加速不支持该特殊规格或遇到破损异常，自动平滑切换至 CPU 软件容错编码优化...")
+
+            if temp_output_file.exists():
+                temp_output_file.unlink(missing_ok=True)
+
+            fallback_video_args = build_video_encode_args(
+                encoder="libx264",
+                target_bps=target_bps,
+                orig_v_bitrate=orig_v_bitrate,
+                crf=crf,
+                preset=preset,
+                gop_size=gop_size,
+                keyint_min=keyint_min,
+                width=target_w,
+                height=target_h
+            )
+            cmd_sw_fallback = (
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
+                 "-err_detect", "ignore_err", "-fflags", "+discardcorrupt+genpts"]
+                + get_input_args(file_path, info.get("codec", ""))
+                + map_args + vf_fix_args + fallback_video_args + audio_args + [
+                    "-avoid_negative_ts", "make_zero",
+                    "-movflags", "+faststart",
+                    str(temp_output_file)
+                ]
+            )
+            success, last_err_msg = execute_ffmpeg(cmd_sw_fallback)
+            is_truncated = False
+            if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+                out_probe = probe_video(temp_output_file)
+                if not out_probe or not out_probe.get("width"):
+                    success = False
+                    last_err_msg = "CPU 软件转码产物无有效视频流"
+                else:
+                    out_dur = out_probe.get("duration", 0.0)
+                    ref_dur = duration
+                    if ref_dur <= 0.0 and orig_bitrate > 0:
+                        ref_dur = (orig_size * 8.0) / orig_bitrate
+                    if ref_dur > 15.0 and out_dur > 0.0 and out_dur < (ref_dur * 0.94) and (ref_dur - out_dur) > 4.0:
+                        is_truncated = True
+                        last_err_msg = f"CPU 软件转码后依然截断 (源时长: {ref_dur:.1f}s, 产物仅: {out_dur:.1f}s)！原片损坏严重"
+                        success = False
+            else:
+                success = False
+
+        if is_truncated:
+            success = False
 
         if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
             new_size = temp_output_file.stat().st_size
@@ -1676,8 +2380,21 @@ def process_video(
             print(f"[完成] {action_desc}成功! 耗时: {duration_sec:.1f}s")
             print(f"  * 原始大小: {format_bytes(orig_size)} -> {size_label}: {format_bytes(new_size)} ({size_change:+.1f}%)")
             print(f"  * 输出路径: {final_output_file}")
+            if vlog:
+                vlog.log_processed(
+                    input_file=file_path,
+                    output_target=final_output_file,
+                    status="SUCCESS",
+                    action="COMPRESS" if need_compress else "REPACKAGE",
+                    orig_size=orig_size,
+                    new_size=new_size,
+                    elapsed_sec=duration_sec,
+                    orig_info=info,
+                    details=reason,
+                    tool="vfix"
+                )
             if delete_source:
-                remove_source_files([file_path], final_output_file)
+                remove_source_files([file_path], final_output_file, reason="转码压缩成功后安全清理源文件 (--delete-source)")
             return True
         else:
             print(f"[失败] 残缺数据破坏过于严重，未能成功生成: {file_path.name}", file=sys.stderr)
@@ -1686,8 +2403,22 @@ def process_video(
                 print(f"  [底层错误] {snippet}", file=sys.stderr)
             if temp_output_file.exists():
                 temp_output_file.unlink(missing_ok=True)
+            if vlog:
+                vlog.log_processed(
+                    input_file=file_path,
+                    output_target=None,
+                    status="FAILED",
+                    action="COMPRESS" if need_compress else "REPACKAGE",
+                    orig_size=orig_size,
+                    elapsed_sec=duration_sec,
+                    orig_info=info,
+                    details=last_err_msg or "未知转码错误",
+                    tool="vfix"
+                )
             return False
     finally:
+        if temp_output_file.exists():
+            temp_output_file.unlink(missing_ok=True)
         if salvaged_audio_file and salvaged_audio_file.exists():
             salvaged_audio_file.unlink(missing_ok=True)
 
@@ -2010,8 +2741,21 @@ def process_merged_videos(
                     print(f"[完成] {done_label} (极速无损流复制)! 耗时: {duration_sec:.1f}s")
                     print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
                     print(f"  * 输出路径: {final_output_file}")
+                    if vlog:
+                        vlog.log_processed(
+                            input_file=file_paths,
+                            output_target=final_output_file,
+                            status="SUCCESS",
+                            action="MERGE_ONLY" if is_merge_only else "MERGE_STREAM_COPY",
+                            orig_size=total_orig_size,
+                            new_size=new_size,
+                            elapsed_sec=duration_sec,
+                            orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
+                            details=f"极速无损流复制合并 ({n_files} 个分卷)",
+                            tool="vfix"
+                        )
                     if delete_source:
-                        remove_source_files(file_paths, final_output_file)
+                        remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                     return True
                 else:
                     if temp_output_file.exists():
@@ -2111,8 +2855,21 @@ def process_merged_videos(
                 print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
                 print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
                 print(f"  * 输出路径: {final_output_file}")
+                if vlog:
+                    vlog.log_processed(
+                        input_file=file_paths,
+                        output_target=final_output_file,
+                        status="SUCCESS",
+                        action="MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS",
+                        orig_size=total_orig_size,
+                        new_size=new_size,
+                        elapsed_sec=duration_sec,
+                        orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
+                        details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷)",
+                        tool="vfix"
+                    )
                 if delete_source:
-                    remove_source_files(file_paths, final_output_file)
+                    remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                 return True
             else:
                 if temp_output_file.exists():
@@ -2282,8 +3039,21 @@ def process_merged_videos(
             print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
             print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
             print(f"  * 输出路径: {final_output_file}")
+            if vlog:
+                vlog.log_processed(
+                    input_file=file_paths,
+                    output_target=final_output_file,
+                    status="SUCCESS",
+                    action="MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS",
+                    orig_size=total_orig_size,
+                    new_size=new_size,
+                    elapsed_sec=duration_sec,
+                    orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
+                    details=f"多源滤镜对齐拼接合并 ({n_files} 个分卷)",
+                    tool="vfix"
+                )
             if delete_source:
-                remove_source_files(file_paths, final_output_file)
+                remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
             return True
         else:
             action_label = "单独合并" if is_merge_only else "多分卷合并压缩"
@@ -2291,10 +3061,26 @@ def process_merged_videos(
             if last_err_msg:
                 snippet = "\n".join(last_err_msg.splitlines()[-4:])
                 print(f"  [底层错误] {snippet}", file=sys.stderr)
+            if vlog:
+                vlog.log_processed(
+                    input_file=file_paths,
+                    output_target=None,
+                    status="FAILED",
+                    action="MERGE_FAILED",
+                    orig_size=total_orig_size,
+                    elapsed_sec=duration_sec,
+                    orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
+                    details=f"合并失败 ({n_files} 个分卷): {last_err_msg or '未知错误'}",
+                    tool="vfix"
+                )
             if temp_output_file.exists():
                 temp_output_file.unlink(missing_ok=True)
             return False
     finally:
+        if temp_output_file.exists():
+            temp_output_file.unlink(missing_ok=True)
+        if concat_list_file and concat_list_file.exists():
+            concat_list_file.unlink(missing_ok=True)
         for sf in salvaged_audio_files:
             if sf and sf.exists():
                 sf.unlink(missing_ok=True)
@@ -2351,6 +3137,20 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
                     i += 2
                     continue
             norm_args.append("-c")
+            i += 1
+            continue
+
+        # 容错：后台运行与任务守护相关参数
+        if arg in ("-background", "-daemon"):
+            norm_args.append("--background")
+            i += 1
+            continue
+        if arg == "-status":
+            norm_args.append("--status")
+            i += 1
+            continue
+        if arg == "-stop":
+            norm_args.append("--stop")
             i += 1
             continue
 
@@ -2560,11 +3360,17 @@ def main():
 
 6. 仅修复容器封装损坏（不改变画质、不耗费重编码时间）:
    vfix broken_index.mp4 --force-repair-only
+
+7. 后台脱机批量运行与状态管理 (多任务/长耗时必备，关闭终端/断开SSH不中断):
+   vfix *.part -d -B                            # 后台脱机运行，终端即刻释放
+   vfix /mnt/nas/videos/ -r -d -B               # 后台脱机递归处理整个目录并安全清理源文件
+   vfix --status                                # 实时查看后台任务运行状态、当前进度与最新日志
+   vfix --stop                                  # 安全终止后台任务 (严格保护源文件，清理临时缓存)
 ================================================================================
 """
     )
     # 输入与输出
-    parser.add_argument("inputs", nargs="+", type=str,
+    parser.add_argument("inputs", nargs="*", type=str, default=[],
                         help="输入文件、文件夹或通配符 (例如: video.mp4, *.part, CD1.avi CD2.avi, /path/to/dir/)")
     parser.add_argument("-o", "--output-dir", type=str, default=None,
                         help="指定输出目录或输出文件名 (例如: -o /mnt/nas/ 或 -o full_movie.mp4)")
@@ -2572,6 +3378,15 @@ def main():
                         help="处理或合并完全成功后自动删除源文件 (谨慎使用；若失败或手动中断则严格保护绝不删除)")
     parser.add_argument("-r", "--recursive", action="store_true",
                         help="当输入为目录时，递归扫描并处理其下所有子目录中的视频")
+
+    # 后台运行与任务守护
+    daemon_group = parser.add_argument_group("后台运行与任务守护 (脱机运行)")
+    daemon_group.add_argument("-B", "--background", "--daemon", action="store_true",
+                              help="将任务转入后台脱机运行 (即刻释放终端，终端关闭或网络中断不影响执行)")
+    daemon_group.add_argument("--status", action="store_true",
+                              help="查看当前后台任务运行状态、PID 及最新实时日志")
+    daemon_group.add_argument("--stop", action="store_true",
+                              help="安全终止当前正在运行的后台任务 (确保保护源文件并清理临时缓存)")
 
     # 分卷合并选项
     parser.add_argument("-M", "--merge-only", "--concat-only", dest="merge_only", action="store_true",
@@ -2617,8 +3432,39 @@ def main():
     parser.add_argument("--force-repair-only", action="store_true",
                         help="强制仅修复损坏封装结构与音视频同步 (不重新编码，0 耗时)")
 
+    # 运行审计与日志记录 (默认 100% 自动记录至 ~/.vfix/logs/)
+    log_group = parser.add_argument_group("运行审计与日志记录 (默认全自动生成)")
+    log_group.add_argument("--log-dir", type=str, default=None,
+                           help="自定义日志保存目录 (默认全自动存储至: ~/.vfix/logs/)")
+    log_group.add_argument("--no-log", action="store_true",
+                           help="禁用所有文件处理与删除日志记录 (默认已开启自动记录)")
+
     norm_argv = normalize_cli_args(sys.argv[1:])
     args = parser.parse_args(norm_argv)
+
+    vlog.setup_logger(log_dir=args.log_dir, enabled=not args.no_log, tool_name="vfix")
+    daemon_mgr = DaemonManager(tool_name="vfix", log_file=vlog.get_main_log_path())
+
+    # 优先响应后台任务管理指令 (--status / --stop)
+    if args.status:
+        daemon_mgr.show_status()
+        sys.exit(0)
+
+    if args.stop:
+        daemon_mgr.stop_daemon()
+        sys.exit(0)
+
+    if not args.inputs:
+        parser.print_help()
+        print("\n[错误] 请提供待处理的视频文件、目录或通配符。")
+        print("  常用示例:")
+        print("    vfix video.mp4                                 # 自动修复并压缩单个视频")
+        print("    vfix *.mp4 -B                                  # 后台脱机批量处理当前目录所有视频")
+        print("    vfix --status                                  # 查看后台任务运行状态与实时日志")
+        print("    vfix --stop                                    # 安全停止当前后台任务")
+        sys.exit(1)
+
+    setup_signal_handlers()
 
     if not check_ffmpeg():
         sys.exit(1)
@@ -2660,6 +3506,13 @@ def main():
         print(f"[提示] 未找到符合条件的受支持视频文件: {args.inputs}")
         sys.exit(0)
 
+    # 若指定了后台运行模式，在此处分叉并退出父进程
+    if args.background:
+        daemon_mgr.daemonize(file_count=len(video_files), raw_argv=sys.argv[1:])
+
+    session_start_time = time.time()
+    vlog.log_session_start(sys.argv[1:], len(video_files), tool="vfix")
+
     if is_merge:
         if len(video_files) == 1:
             print(f"[提示] 仅检测到 1 个视频文件 ({video_files[0].name})，无需合并，自动转为单文件修复{'与压缩' if not is_merge_only else ''}流程。")
@@ -2680,6 +3533,11 @@ def main():
                 drop_ads=args.drop_ads,
                 max_ad_duration=args.max_ad_duration
             )
+            total_cost = time.time() - session_start_time
+            if vlog:
+                vlog.log_session_end(1 if ok else 0, 0 if ok else 1, total_cost, tool="vfix")
+            if not args.no_log:
+                print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vfix.log)")
             sys.exit(0 if ok else 1)
         else:
             if not is_merge_only:
@@ -2694,17 +3552,24 @@ def main():
                 force_compress=args.force_compress,
                 force_repair_only=args.force_repair_only,
                 merge_only=args.merge_only,
-                skip_confirm=args.yes,
+                skip_confirm=args.yes or args.background,
                 delete_source=args.delete_source,
                 crop=crop_setting,
                 aspect=args.aspect
             )
+            total_cost = time.time() - session_start_time
+            if vlog:
+                vlog.log_session_end(1 if ok else 0, 0 if ok else 1, total_cost, tool="vfix")
             print("\n" + "=" * 70)
             action_desc = "单独合并" if is_merge_only else "合并并压缩"
             print(f"处理完成汇总: {action_desc} {len(video_files)} 个分卷，状态: {'成功' if ok else '失败'}。")
+            if not args.no_log:
+                print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vfix.log)")
             sys.exit(0 if ok else 1)
 
     print(f"找到 {len(video_files)} 个待处理视频文件。")
+    if not args.no_log:
+        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vfix.log) [自动记录]")
     print(f"加速引擎: [{get_engine_desc(encoder)}]")
 
     success_count = 0
@@ -2734,8 +3599,14 @@ def main():
         else:
             fail_count += 1
 
+    total_cost = time.time() - session_start_time
+    if vlog:
+        vlog.log_session_end(success_count, fail_count, total_cost, tool="vfix")
+
     print("\n" + "=" * 70)
     print(f"处理完成汇总: 共 {len(video_files)} 个，成功: {success_count} 个，失败: {fail_count} 个。")
+    if not args.no_log:
+        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vfix.log)")
 
 
 if __name__ == "__main__":
