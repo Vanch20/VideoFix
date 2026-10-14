@@ -3449,6 +3449,12 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
 
     for pattern_str in input_patterns:
         p = normalize_and_resolve_path(pattern_str)
+        if not p.exists():
+            for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".wmv"]:
+                cand = normalize_and_resolve_path(f"{pattern_str}{ext}")
+                if cand.is_file():
+                    p = cand
+                    break
         if p.exists():
             if p.is_file():
                 if not should_skip(p):

@@ -1188,6 +1188,16 @@ def analyze_frame_content_box(
     else:
         x_start, x_end = h_span[0], h_span[1]
 
+    left_b = x_start
+    right_b = w - 1 - x_end
+    # 工业标准对称性防误裁：真正的画幅黑边 (Pillarbox/Letterbox) 在左右或上下必定大体对称
+    # 若单侧很深而另一侧很浅 (如一侧暗角/单侧打光/侧身特写)，属于电影正常明暗光影，绝不能当成黑边裁掉！
+    if left_b > 16 or right_b > 16:
+        total_lr = left_b + right_b
+        diff_lr = abs(left_b - right_b)
+        if diff_lr > max(16, total_lr * 0.40):
+            x_start, x_end = 0, w - 1
+
     content_w = x_end - x_start + 1
 
     # 2. 上下黑边探测：在识别出的主体横向画面内探测纵向画面范围
@@ -1206,6 +1216,14 @@ def analyze_frame_content_box(
         y_start, y_end = 0, h - 1
     else:
         y_start, y_end = v_span[0], v_span[1]
+
+    top_b = y_start
+    bottom_b = h - 1 - y_end
+    if top_b > 16 or bottom_b > 16:
+        total_tb = top_b + bottom_b
+        diff_tb = abs(top_b - bottom_b)
+        if diff_tb > max(16, total_tb * 0.45):
+            y_start, y_end = 0, h - 1
 
     cw = ((x_end - x_start + 1) // 2) * 2
     ch = ((y_end - y_start + 1) // 2) * 2
@@ -1630,52 +1648,81 @@ def smooth_and_merge_segments(
 ) -> List[Tuple[float, float, str]]:
     """
     智能平滑与吸收瞬态镜头：
-    1. 低于 4.0s 的超短镜头（如瞬时转场闪黑、2秒片名插图）自动并入相邻主要片段；
+    1. 彻底吸收低于 min_duration 的碎片短镜头（如暗光场景、瞬时转场闪黑、短镜头切换），并入相邻主要片段；
     2. 合并连续相同画幅片段；
-    3. 严禁跨不同画幅类别（横屏 vs 竖屏）盲目合并片段（尤其是片头与正片），保证各自独立纯粹；
-    4. 若开启 drop_ads (或由 --drop-ads 触发)，自动识别混剪中的广告/插片并直接剔除。
+    3. 若某种主导画幅占比超 85% 且非主导总时长极短，自动判定全片为统一画幅，防止普通影片暗光误切；
+    4. 若开启 drop_ads，根据优势主画幅识别混剪中的广告/插片并直接剔除。
     """
     if not segments:
         return []
 
-    # 第一阶段：超短镜头 (< 4.0s) 吸收平滑
-    absorbed: List[Tuple[float, float, str]] = []
-    for seg in segments:
-        s, e, kind = seg
-        dur = e - s
-        if dur < 4.0 and absorbed:
-            prev_s, prev_e, prev_k = absorbed[-1]
-            absorbed[-1] = (prev_s, e, prev_k)
-        else:
-            absorbed.append(seg)
+    curr_segs = [(s, e, k) for s, e, k in segments]
 
-    # 第二阶段：连续相同画幅类别合并
-    merged: List[Tuple[float, float, str]] = []
-    for seg in absorbed:
-        if not merged:
-            merged.append(seg)
-        else:
-            prev_s, prev_e, prev_k = merged[-1]
-            if seg[2] == prev_k:
-                merged[-1] = (prev_s, seg[1], prev_k)
-            else:
-                merged.append(seg)
-
-    # 第三阶段：统计各画幅累计时长以判定核心正片类型
+    # 统计各画幅累计时长以判定核心正片类型
     kind_durations: Dict[str, float] = {}
-    for s, e, k in merged:
+    for s, e, k in curr_segs:
         kind_durations[k] = kind_durations.get(k, 0.0) + (e - s)
+    total_len = sum(kind_durations.values())
 
     target_ratio = parse_aspect_ratio(target_aspect) if target_aspect else None
     if target_ratio:
-        dominant_kind = "vertical" if target_ratio < 0.9 else ("horizontal" if target_ratio >= 1.25 else "square")
+        dominant_kind = "vertical" if target_ratio < 0.9 else "horizontal"
     else:
-        dominant_kind = max(kind_durations, key=kind_durations.get) if kind_durations else "vertical"
+        dominant_kind = max(kind_durations, key=kind_durations.get) if kind_durations else "horizontal"
 
-    # 第四阶段：广告/片头过滤 (如果启用了 drop_ads)
+    dominant_ratio = (kind_durations.get(dominant_kind, 0.0) / total_len) if total_len > 0 else 1.0
+
+    # 循环合并相邻同画幅并吸收低于 min_duration 的碎片段
+    while True:
+        merged = []
+        for seg in curr_segs:
+            if not merged:
+                merged.append(seg)
+            else:
+                prev_s, prev_e, prev_k = merged[-1]
+                if seg[2] == prev_k:
+                    merged[-1] = (prev_s, seg[1], prev_k)
+                else:
+                    merged.append(seg)
+        curr_segs = merged
+
+        if len(curr_segs) <= 1:
+            break
+
+        changed = False
+        new_segs = []
+        i = 0
+        while i < len(curr_segs):
+            s, e, k = curr_segs[i]
+            dur = e - s
+            is_potential_ad = drop_ads and (k != dominant_kind) and (dur <= max_ad_duration)
+
+            if dur < min_duration and not is_potential_ad:
+                changed = True
+                if new_segs:
+                    ps, pe, pk = new_segs[-1]
+                    new_segs[-1] = (ps, e, pk)
+                elif i + 1 < len(curr_segs):
+                    ns, ne, nk = curr_segs[i + 1]
+                    curr_segs[i + 1] = (s, ne, nk)
+                else:
+                    new_segs.append((s, e, k))
+            else:
+                new_segs.append((s, e, k))
+            i += 1
+        curr_segs = new_segs
+        if not changed:
+            break
+
+    # 若主导画幅占比极高 (>= 85%)，且非主导片段总时长很短（<= 30s），直接判定为统一画幅
+    non_dominant_dur = sum((e - s) for s, e, k in curr_segs if k != dominant_kind)
+    if dominant_ratio >= 0.85 and non_dominant_dur < 30.0 and not drop_ads:
+        return [(curr_segs[0][0], curr_segs[-1][1], dominant_kind)]
+
+    # 广告/片头过滤 (如果启用了 drop_ads)
     if drop_ads:
         filtered: List[Tuple[float, float, str]] = []
-        for s, e, k in merged:
+        for s, e, k in curr_segs:
             dur = e - s
             is_ad = False
             if target_ratio:
@@ -1691,7 +1738,7 @@ def smooth_and_merge_segments(
                 filtered.append((s, e, k))
         return filtered
 
-    return merged
+    return curr_segs
 
 
 def detect_scene_segments(
@@ -1710,10 +1757,10 @@ def detect_scene_segments(
     """
     智能识别混剪视频中横竖屏切换转场时间点，并对每个切片独立计算最佳 crop 区域。
     1. 轻量级时间线全片高速抽样扫描 (scale 360:-2, 内存管道直通解析，20~30 分钟视频仅需数秒)；
-    2. 时间线中值滤波平滑单样本瞬态噪点；
-    3. 倒序步进与二分微调定位毫秒/关键帧级转场精确跳变点；
-    4. 执行短镜头吸收平滑过滤与广告/片头识别剔除；
-    5. 对每一个独立画幅分段调用高精度多点采样算法计算最佳 Crop 参数；
+    2. 画幅迟滞判定与时间线中值滤波平滑单样本瞬态噪点；
+    3. 短镜头严格吸收平滑过滤与广告/片头识别剔除；
+    4. 仅对确认真实存在的场景分段转场边界做毫秒级精确定位 (避免上百次无意义重试)；
+    5. 对每一个独立画幅分段调用多点采样算法计算最佳 Crop 参数；
     6. 若检测到全片画幅自始至终一致（仅 1 段），返回空列表 [] 触发平滑回退。
     """
     if duration <= min_segment_duration * 1.5:
@@ -1747,6 +1794,7 @@ def detect_scene_segments(
     ]
 
     samples: List[Tuple[float, str, float]] = []
+    last_stable_kind = "horizontal"
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         frame_idx = 0
@@ -1757,9 +1805,21 @@ def detect_scene_segments(
             t_sec = min(duration, frame_idx * step)
             box = analyze_frame_content_box(raw_b, scaled_w, scaled_h, thresh=limit)
             if box:
-                cw, ch, _, _ = box
+                cw, ch, cx, cy = box
                 ratio = cw / max(1, ch)
-                kind = "vertical" if ratio < 0.9 else ("horizontal" if ratio >= 1.25 else "square")
+                left_bar = cx
+                right_bar = scaled_w - (cx + cw)
+                is_centered = abs(left_bar - right_bar) <= (scaled_w * 0.15)
+                # 判定横屏与竖屏：
+                # 真正的手机竖屏短剧居中放置时，左右必定对称且宽高比显著 <= 0.80 (如 9:16 ~ 0.56, 3:4 ~ 0.75)
+                # 若左右不对称 (如电影单侧打光/靠墙暗景) 或比例在 0.80~1.25 之间，保持上一稳定状态，彻底消除伪切换
+                if ratio <= 0.80 and is_centered:
+                    kind = "vertical"
+                elif ratio >= 1.25:
+                    kind = "horizontal"
+                else:
+                    kind = last_stable_kind
+                last_stable_kind = kind
                 samples.append((t_sec, kind, ratio))
             frame_idx += 1
         proc.stdout.close()
@@ -1780,6 +1840,31 @@ def detect_scene_segments(
         if curr_k != prev_k and prev_k == next_k:
             clean_samples[i] = (clean_samples[i][0], prev_k, clean_samples[i][2])
 
+    # 2. 初始粗聚类并直接平滑吸收（将采样噪点直接消除）
+    coarse_transitions = []
+    last_kind = None
+    last_t = 0.0
+    for t_sec, kind, _ in clean_samples:
+        if kind != last_kind:
+            if last_kind is not None:
+                coarse_transitions.append((last_t, t_sec, last_kind))
+                last_t = t_sec
+            last_kind = kind
+    coarse_transitions.append((last_t, duration, last_kind))
+
+    clean_segments = smooth_and_merge_segments(
+        coarse_transitions,
+        min_duration=min_segment_duration,
+        drop_ads=drop_ads,
+        max_ad_duration=max_ad_duration,
+        target_aspect=target_aspect
+    )
+
+    if len(clean_segments) <= 1:
+        # 全片画幅风格高度一致，直接平滑回退为常规单视频去黑边流程
+        return []
+
+    # 3. 对确认真实存在的场景分段转场边界做微调精确切点定位 (仅对真正的转场做微调，毫秒级完成)
     def get_kind_at(t_probe: float) -> str:
         cmd_p = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -1795,12 +1880,12 @@ def detect_scene_segments(
                 p_box = analyze_frame_content_box(p_res.stdout, scaled_w, scaled_h, thresh=limit)
                 if p_box:
                     p_ratio = p_box[0] / max(1, p_box[1])
-                    return "vertical" if p_ratio < 0.9 else ("horizontal" if p_ratio >= 1.25 else "square")
+                    return "vertical" if p_ratio < 0.85 else ("horizontal" if p_ratio >= 1.25 else "unknown")
         except Exception:
             pass
         return "unknown"
 
-    def refine_transition(t_low: float, t_high: float, target_k: str, tol: float = 0.15) -> float:
+    def refine_transition(t_low: float, t_high: float, target_k: str, tol: float = 0.25) -> float:
         low, high = t_low, t_high
         while high - low > tol:
             mid = (low + high) / 2.0
@@ -1811,47 +1896,28 @@ def detect_scene_segments(
                 low = mid
         return round(high, 2)
 
-    # 2. 初始聚类与倒序步进二分精准校准转场点
-    raw_transitions = []
-    last_kind = None
-    last_t = 0.0
-    for t_sec, kind, _ in clean_samples:
-        if kind != last_kind:
-            if last_kind is not None:
-                p_start = max(last_t, t_sec - step - 1.0)
-                p_end = min(duration, t_sec + step + 1.0)
-
-                last_prev_pt = None
-                for pt in range(int(p_end), int(p_start) - 1, -1):
-                    if get_kind_at(float(pt)) == last_kind:
-                        last_prev_pt = pt
-                        break
-
-                if last_prev_pt is not None:
-                    exact_cut = refine_transition(float(last_prev_pt), min(duration, float(last_prev_pt + 1.5)), kind)
-                else:
-                    exact_cut = t_sec
-
-                raw_transitions.append((last_t, exact_cut, last_kind))
-                last_t = exact_cut
-            last_kind = kind
-    raw_transitions.append((last_t, duration, last_kind))
-
-    # 3. 执行短片段吸收与同画幅合并 (支持可选剔除广告)
-    clean_segments = smooth_and_merge_segments(
-        raw_transitions,
-        min_duration=min_segment_duration,
-        drop_ads=drop_ads,
-        max_ad_duration=max_ad_duration,
-        target_aspect=target_aspect
-    )
-
-    if len(clean_segments) <= 1:
-        return []
+    refined_segments: List[Tuple[float, float, str]] = []
+    for idx, (s, e, kind) in enumerate(clean_segments):
+        start_pt = s
+        end_pt = e
+        if idx > 0:
+            start_pt = refined_segments[-1][1]
+        if idx < len(clean_segments) - 1:
+            next_kind = clean_segments[idx + 1][2]
+            p_start = max(start_pt, e - step)
+            p_end = min(duration, e + step)
+            try:
+                exact_cut = refine_transition(p_start, p_end, next_kind)
+                end_pt = exact_cut
+            except Exception:
+                end_pt = e
+        else:
+            end_pt = duration
+        refined_segments.append((start_pt, end_pt, kind))
 
     # 4. 针对每个独立分段，高精度探测最佳 Crop 裁切参数
     final_segments: List[Dict[str, Any]] = []
-    for idx, (s, e, kind) in enumerate(clean_segments, 1):
+    for idx, (s, e, kind) in enumerate(refined_segments, 1):
         seg_dur = e - s
         crop_res = detect_crop_box(
             file_path=file_path,
@@ -1870,7 +1936,7 @@ def detect_scene_segments(
                 "has_black_bars": False
             }
 
-        aspect_label = "9-16" if kind == "vertical" else ("16-9" if kind == "horizontal" else "square")
+        aspect_label = "9-16" if kind == "vertical" else "16-9"
         final_segments.append({
             "part_index": idx,
             "start": s,
@@ -2858,6 +2924,12 @@ def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Pa
 
     for pat in patterns:
         path_obj = normalize_and_resolve_path(pat)
+        if not path_obj.exists():
+            for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".wmv"]:
+                cand = normalize_and_resolve_path(f"{pat}{ext}")
+                if cand.is_file():
+                    path_obj = cand
+                    break
         if path_obj.is_file():
             if not path_obj.name.startswith("._") and not path_obj.name.startswith("."):
                 res = path_obj.resolve()
