@@ -111,6 +111,13 @@ LEGACY_INEFFICIENT_CODECS = {
     "indeo3", "indeo4", "indeo5", "cinepak", "qtrle", "smc"
 }
 
+# 常见老旧或非标准 MP4 视频封装容器后缀（当视频编码已是现代规范如 H.264/HEVC 时，仅需换封装至 MP4 即可秒级无损兼容）
+LEGACY_OR_NON_MP4_CONTAINERS = {
+    ".avi", ".mkv", ".flv", ".f4v", ".ts", ".m2ts", ".mts",
+    ".wmv", ".asf", ".mov", ".3gp", ".3g2", ".mpg", ".mpeg",
+    ".vob", ".divx", ".xvid", ".ogv", ".rmvb", ".rm", ".webm"
+}
+
 # 各分辨率在现代高能效 H.264 (High Profile, B-frames, AQ) 下的高清黄金基准码率锚点 (bps)
 STANDARD_TARGET_BITRATES_H264 = [
     (320 * 240, 400 * 1000),           # 240p  ~ 400 kbps
@@ -230,6 +237,22 @@ def format_bitrate(bps: float) -> str:
     if bps < 1_000_000:
         return f"{bps / 1000:.0f} kbps"
     return f"{bps / 1_000_000:.2f} Mbps"
+
+
+def get_video_container_ext(file_path: Path) -> str:
+    """提取去除临时下载后缀后的真实视频容器扩展名 (如 a.avi.part -> .avi, video.mp4 -> .mp4)。"""
+    name = file_path.name
+    lower = name.lower()
+    stripped = True
+    while stripped:
+        stripped = False
+        for temp_ext in TEMP_DOWNLOAD_EXTENSIONS:
+            if lower.endswith(temp_ext):
+                name = name[:-len(temp_ext)]
+                lower = name.lower()
+                stripped = True
+                break
+    return Path(name).suffix.lower()
 
 
 def get_clean_stem(file_path: Path) -> str:
@@ -993,7 +1016,9 @@ def should_compress(
 ) -> Tuple[bool, str]:
     """
     判断当前视频是否需要执行重新编码压缩。
-    对于残缺的 .part 文件及早期陈旧低效编码 (mpeg4/wmv/mpeg2 等)，默认坚决执行修复并转码压缩。
+    - 对于残缺的 .part 文件及早期陈旧低效编码 (mpeg4/wmv/mpeg2 等)，默认坚决执行修复并转码压缩。
+    - 对于原片已是主流 H.264 或现代高效编码 (HEVC/AV1) 的老旧/非标封装容器 (.avi/.mkv/.flv/.ts/.wmv 等)，
+      坚决优先执行极速无损换封装至标准 MP4 (-c:v copy)，杜绝耗时且有损的重新编码。
     """
     if force_repair_only:
         return False, "用户指定强制仅修复封装 (--force-repair-only)"
@@ -1009,40 +1034,59 @@ def should_compress(
     orig_v_bitrate = info.get("video_bitrate", 0.0)
     ref_orig_bitrate = orig_v_bitrate if orig_v_bitrate > 0 else orig_bitrate
     codec = info.get("codec", "").lower()
+    container_ext = get_video_container_ext(file_path)
 
     # 1. 陈旧低效编码（如 mpeg4/xvid/divx, wmv, flv, mpeg2 等）：
     # 压缩比极差、体积严重虚高且缺乏现代硬解支持，坚决必须转码压缩升级！
     if codec in LEGACY_INEFFICIENT_CODECS or (codec and codec not in MP4_COMPLIANT_VIDEO_CODECS):
         return True, f"原视频编码格式为早期低效编码 ({codec})，体积虚高且现代硬解兼容性差，必须升级转码为现代高效流媒体格式并压缩"
 
-    if ref_orig_bitrate <= 0:
-        return True, "原文件码率无法精确探测，执行容错修复并转码压缩"
+    # 2. 判断是否为早期老旧容器或非标准 MP4 封装
+    is_legacy_or_non_mp4_container = (
+        container_ext in LEGACY_OR_NON_MP4_CONTAINERS or
+        container_ext not in (".mp4", ".m4v")
+    )
+    c_label = container_ext if container_ext else file_path.suffix
 
-    # 2. 若原视频已经是 HEVC/H.265/AV1 高效编码：
+    # 3. 原片已是主流工业级 H.264 (AVC) 编码：
+    is_h264 = codec in ("h264", "avc", "avc1")
+    if is_h264:
+        # 若容器为老旧/非标封装 (如 .avi, .mkv, .flv, .ts, .wmv, .mov 等)：
+        # 原画质已是高兼容现代标准，仅需换封装至 MP4，坚决杜绝耗时且损耗画质的重新编码！
+        if is_legacy_or_non_mp4_container:
+            return False, f"原片已是主流 H.264 编码，容器为早期/非标封装 ({c_label})，直接执行极速无损换封装至标准 MP4 (0重编码、0画质损失、秒级完成)"
+
+        # 若原片本身已是标准 MP4 容器：
+        # 仅当目标编码器为 HEVC 且原码率明显高于基准、节约率显著 (>= 25%) 时才转码压缩
+        is_target_hevc = "hevc" in encoder or "265" in encoder
+        if is_target_hevc and ref_orig_bitrate > expected_bitrate:
+            saving_ratio = (ref_orig_bitrate - expected_bitrate) / ref_orig_bitrate
+            if saving_ratio >= 0.25:
+                if "rkmpp" in encoder:
+                    hw_desc = "Rockchip HEVC 硬件编码"
+                elif "videotoolbox" in encoder:
+                    hw_desc = "Apple VideoToolbox HEVC 硬件编码"
+                elif "nvenc" in encoder:
+                    hw_desc = "NVENC HEVC 硬件编码"
+                elif "qsv" in encoder:
+                    hw_desc = "Intel QSV HEVC 硬件编码"
+                elif "vaapi" in encoder:
+                    hw_desc = "VAAPI HEVC 硬件编码"
+                else:
+                    hw_desc = "HEVC/H.265 编码"
+                return True, f"原片为 H.264 ({format_bitrate(ref_orig_bitrate)})，转换为 {hw_desc} 预计可节省 ~{saving_ratio*100:.0f}% 存储空间"
+
+    # 4. 若原视频已经是 HEVC/H.265/AV1 高效编码：
     if codec in MODERN_EFFICIENT_CODECS:
+        if is_legacy_or_non_mp4_container:
+            return False, f"原视频已是现代高效编码 ({codec})，容器为早期/非标封装 ({c_label})，直接执行极速无损换封装至标准 MP4 (0重编码、0画质损失、秒级完成)"
         if ref_orig_bitrate <= expected_bitrate * 1.10:
             return False, f"原视频已是现代高效编码 ({codec}) 且码率已高度紧凑 ({format_bitrate(ref_orig_bitrate)})，无需二次压缩，仅执行快速无损修复封装"
 
-    # 3. 若原视频是 H.264，而目标编码器是 HEVC：
-    is_target_hevc = "hevc" in encoder or "265" in encoder
-    if codec == "h264" and is_target_hevc:
-        saving_ratio = (ref_orig_bitrate - expected_bitrate) / ref_orig_bitrate
-        if saving_ratio >= 0.15:
-            if "rkmpp" in encoder:
-                hw_desc = "Rockchip HEVC 硬件编码"
-            elif "videotoolbox" in encoder:
-                hw_desc = "Apple VideoToolbox HEVC 硬件编码"
-            elif "nvenc" in encoder:
-                hw_desc = "NVENC HEVC 硬件编码"
-            elif "qsv" in encoder:
-                hw_desc = "Intel QSV HEVC 硬件编码"
-            elif "vaapi" in encoder:
-                hw_desc = "VAAPI HEVC 硬件编码"
-            else:
-                hw_desc = "HEVC/H.265 编码"
-            return True, f"原片为 H.264 ({format_bitrate(ref_orig_bitrate)})，转换为 {hw_desc} 预计可节省 ~{saving_ratio*100:.0f}% 存储空间"
+    if ref_orig_bitrate <= 0:
+        return True, "原文件码率无法精确探测，执行容错修复并转码压缩"
 
-    # 4. 常规码率阈值收益判定
+    # 5. 常规码率阈值收益判定
     if ref_orig_bitrate <= expected_bitrate:
         return False, (
             f"原视频码率 ({format_bitrate(ref_orig_bitrate)}) 已处于或低于基准区间 ({format_bitrate(expected_bitrate)})，"
@@ -1359,9 +1403,10 @@ def process_video(
             print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder}) | 目标码率: ~{format_bitrate(target_bps)}")
         else:
             print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset}) | 目标码率: ~{format_bitrate(target_bps)}")
-    print(f"  * 策略决策: [{'修复并转码压缩' if need_compress else '仅修复重新封装'}] -> {reason}")
+    policy_action = "修复并转码压缩" if need_compress else "极速无损换封装"
+    print(f"  * 策略决策: [{policy_action}] -> {reason}")
     if not need_compress and not force_repair_only:
-        print(f"  * 提示: 该文件已处于高能效紧凑状态，若执意强制重新编码可添加参数: --force-compress")
+        print(f"  * 提示: 该文件已处于工业级高兼容或高能效状态，若执意强制重新编码压制可添加参数: --force-compress")
 
     target_dir = output_dir if output_dir else file_path.parent
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1476,8 +1521,9 @@ def process_video(
         last_err_msg = ""
 
         if not need_compress:
-            # === 仅修复模式：尝试快速流复制 ===
-            cmd_copy = base_args + map_args + ["-c:v", "copy"] + audio_args + [
+            # === 仅修复/无损换封装模式：尝试极速流复制 ===
+            tag_args = ["-tag:v", "hvc1"] if codec in ("hevc", "h265") else []
+            cmd_copy = base_args + map_args + ["-c:v", "copy"] + tag_args + audio_args + [
                 "-movflags", "+faststart",
                 str(temp_output_file)
             ]
@@ -1625,8 +1671,10 @@ def process_video(
             # 将本地 SSD 临时生成的文件安全移动到目标位置（支持跨文件系统/SMB共享盘，规避 macOS fcopyfile ENXIO 缺陷）
             safe_move_file(temp_output_file, final_output_file)
 
-            print(f"[完成] 修复与压缩成功! 耗时: {duration_sec:.1f}s")
-            print(f"  * 原始大小: {format_bytes(orig_size)} -> 压缩后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
+            action_desc = "修复与压缩" if need_compress else "极速无损换封装"
+            size_label = "压缩后大小" if need_compress else "换封装后大小"
+            print(f"[完成] {action_desc}成功! 耗时: {duration_sec:.1f}s")
+            print(f"  * 原始大小: {format_bytes(orig_size)} -> {size_label}: {format_bytes(new_size)} ({size_change:+.1f}%)")
             print(f"  * 输出路径: {final_output_file}")
             if delete_source:
                 remove_source_files([file_path], final_output_file)
