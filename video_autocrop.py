@@ -1837,6 +1837,63 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
     return norm_args
 
 
+def expand_glob_pattern(pattern_str: str, recursive: bool) -> List[str]:
+    """智能展开通配符并支持跨平台大小写不敏感与递归深层搜索。"""
+    expanded = os.path.expanduser(pattern_str)
+    candidate_patterns = [expanded]
+
+    if recursive and "**" not in expanded:
+        dir_part, base_part = os.path.split(expanded)
+        if dir_part:
+            rec_pattern = os.path.join(dir_part, "**", base_part)
+        else:
+            rec_pattern = os.path.join("**", base_part)
+        if rec_pattern not in candidate_patterns:
+            candidate_patterns.insert(0, rec_pattern)
+
+    ci_candidates = []
+    for pat in candidate_patterns:
+        dir_part, base_part = os.path.split(pat)
+        res = []
+        in_bracket = False
+        has_alpha = False
+        for char in base_part:
+            if char == '[':
+                in_bracket = True
+                res.append(char)
+            elif char == ']':
+                in_bracket = False
+                res.append(char)
+            elif not in_bracket and char.isalpha():
+                has_alpha = True
+                res.append(f"[{char.lower()}{char.upper()}]")
+            else:
+                res.append(char)
+        if has_alpha:
+            ci_base = "".join(res)
+            ci_pat = os.path.join(dir_part, ci_base) if dir_part else ci_base
+            ci_candidates.append(ci_pat)
+
+    all_patterns = ci_candidates + candidate_patterns
+
+    matched = []
+    for p in all_patterns:
+        m = glob.glob(p, recursive=recursive)
+        if not m:
+            nfd = unicodedata.normalize("NFD", p)
+            if nfd != p:
+                m = glob.glob(nfd, recursive=recursive)
+        if not m:
+            nfc = unicodedata.normalize("NFC", p)
+            if nfc != p:
+                m = glob.glob(nfc, recursive=recursive)
+        if m:
+            matched.extend(m)
+            break
+
+    return matched
+
+
 def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Path]:
     """收集待处理视频文件列表。"""
     collected: List[Path] = []
@@ -1872,16 +1929,7 @@ def collect_video_files(patterns: List[str], recursive: bool = False) -> List[Pa
                         collected.append(f)
         else:
             # 通配符匹配
-            expanded_pat = os.path.expanduser(pat)
-            matched = glob.glob(expanded_pat, recursive=recursive)
-            if not matched:
-                nfd_pat = unicodedata.normalize("NFD", expanded_pat)
-                if nfd_pat != expanded_pat:
-                    matched = glob.glob(nfd_pat, recursive=recursive)
-            if not matched:
-                nfc_pat = unicodedata.normalize("NFC", expanded_pat)
-                if nfc_pat != expanded_pat:
-                    matched = glob.glob(nfc_pat, recursive=recursive)
+            matched = expand_glob_pattern(pat, recursive=recursive)
 
             for match_str in matched:
                 p = normalize_and_resolve_path(match_str)

@@ -2312,6 +2312,71 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
     return norm_args
 
 
+def expand_glob_pattern(pattern_str: str, recursive: bool) -> List[str]:
+    """
+    智能展开通配符并支持跨平台大小写不敏感与递归深层搜索：
+    1. 当 recursive=True 时，自动将 *.wmv 或 path/*.wmv 转换为 **/*.[wW][mM][vV]，确保 Python 的 glob 能够穿透所有子目录；
+    2. 解决 Linux 下大小写敏感导致的 *.wmv 无法匹配 *.WMV 的问题；
+    3. 支持 macOS / Linux SMB 挂载盘上的 NFD / NFC Unicode 自动对齐匹配。
+    """
+    expanded = os.path.expanduser(pattern_str)
+    candidate_patterns = [expanded]
+
+    # 1. 若开启递归遍历且未显式指定 **，自动注入 ** 以穿透子目录
+    rec_pattern = expanded
+    if recursive and "**" not in expanded:
+        dir_part, base_part = os.path.split(expanded)
+        if dir_part:
+            rec_pattern = os.path.join(dir_part, "**", base_part)
+        else:
+            rec_pattern = os.path.join("**", base_part)
+        if rec_pattern not in candidate_patterns:
+            candidate_patterns.insert(0, rec_pattern)
+
+    # 2. 为模式中的文件名部分生成大小写不敏感变体 (如 *.wmv -> *.[wW][mM][vV])
+    ci_candidates = []
+    for pat in candidate_patterns:
+        dir_part, base_part = os.path.split(pat)
+        res = []
+        in_bracket = False
+        has_alpha = False
+        for char in base_part:
+            if char == '[':
+                in_bracket = True
+                res.append(char)
+            elif char == ']':
+                in_bracket = False
+                res.append(char)
+            elif not in_bracket and char.isalpha():
+                has_alpha = True
+                res.append(f"[{char.lower()}{char.upper()}]")
+            else:
+                res.append(char)
+        if has_alpha:
+            ci_base = "".join(res)
+            ci_pat = os.path.join(dir_part, ci_base) if dir_part else ci_base
+            ci_candidates.append(ci_pat)
+
+    all_patterns = ci_candidates + candidate_patterns
+
+    matched = []
+    for p in all_patterns:
+        m = glob.glob(p, recursive=recursive)
+        if not m:
+            nfd = unicodedata.normalize("NFD", p)
+            if nfd != p:
+                m = glob.glob(nfd, recursive=recursive)
+        if not m:
+            nfc = unicodedata.normalize("NFC", p)
+            if nfc != p:
+                m = glob.glob(nfc, recursive=recursive)
+        if m:
+            matched.extend(m)
+            break
+
+    return matched
+
+
 def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bool = False) -> List[Path]:
     """收集输入路径列表或通配符匹配下的所有视频及 .part 残缺文件。"""
     collected = []
@@ -2365,16 +2430,7 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
                             collected.append(res)
             continue
 
-        expanded_pattern = os.path.expanduser(pattern_str)
-        matched = glob.glob(expanded_pattern, recursive=recursive)
-        if not matched:
-            nfd_pat = unicodedata.normalize("NFD", expanded_pattern)
-            if nfd_pat != expanded_pattern:
-                matched = glob.glob(nfd_pat, recursive=recursive)
-        if not matched:
-            nfc_pat = unicodedata.normalize("NFC", expanded_pattern)
-            if nfc_pat != expanded_pattern:
-                matched = glob.glob(nfc_pat, recursive=recursive)
+        matched = expand_glob_pattern(pattern_str, recursive=recursive)
 
         for m in matched:
             mp = normalize_and_resolve_path(m).resolve()
