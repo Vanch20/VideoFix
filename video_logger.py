@@ -326,6 +326,7 @@ class DaemonManager:
         self.tool_name = tool_name
         self.base_dir = Path(base_dir).expanduser().resolve() if base_dir else (Path.home() / ".vfix")
         self.pid_file = self.base_dir / f"{tool_name}.pid"
+        self.status_file = self.base_dir / f"{tool_name}_status.json"
         self.log_file = Path(log_file).expanduser().resolve() if log_file else (self.base_dir / "logs" / f"{tool_name}.log")
 
     def is_pid_alive(self, pid: int) -> bool:
@@ -348,14 +349,57 @@ class DaemonManager:
             pid = data.get("pid")
             if pid and self.is_pid_alive(pid):
                 return data
-            # 进程已死亡，清理僵死/遗留的 PID 锁文件
+            # 进程已死亡，清理僵死/遗留的 PID 锁文件与状态文件
             try:
                 self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                self.status_file.unlink(missing_ok=True)
             except Exception:
                 pass
             return None
         except Exception:
             return None
+
+    def update_status(
+        self,
+        current_file: Optional[Union[str, Path]] = None,
+        file_index: Optional[int] = None,
+        total_files: Optional[int] = None,
+        stage: Optional[str] = None,
+        progress_str: Optional[str] = None,
+        percent: Optional[float] = None
+    ) -> None:
+        """更新当前后台任务的实时进度快照，供 --status 即刻查询"""
+        try:
+            status_data = {}
+            if self.status_file.exists():
+                try:
+                    with open(self.status_file, "r", encoding="utf-8") as f:
+                        status_data = json.load(f)
+                except Exception:
+                    status_data = {}
+
+            if current_file is not None:
+                status_data["current_file"] = str(Path(current_file).resolve())
+            if file_index is not None:
+                status_data["file_index"] = file_index
+            if total_files is not None:
+                status_data["total_files"] = total_files
+            if stage is not None:
+                status_data["stage"] = stage
+            if progress_str is not None:
+                status_data["progress_str"] = progress_str
+            if percent is not None:
+                status_data["percent"] = round(percent, 1)
+            status_data["updated_at"] = time.time()
+            status_data["updated_at_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            with open(self.status_file, "w", encoding="utf-8") as f:
+                json.dump(status_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def show_status(self) -> None:
         """查询并打印当前后台任务状态及最新实时日志"""
@@ -376,6 +420,30 @@ class DaemonManager:
             print(f"  * 任务总量: {info.get('file_count', '未知')} 个视频文件")
             if info.get("args"):
                 print(f"  * 运行指令: {' '.join(info['args'])}")
+
+            # 读取实时心跳与文件路径快照
+            if self.status_file.exists():
+                try:
+                    with open(self.status_file, "r", encoding="utf-8") as f:
+                        status_data = json.load(f)
+                    curr_file = status_data.get("current_file")
+                    file_idx = status_data.get("file_index")
+                    total_f = status_data.get("total_files") or info.get("file_count")
+                    stage = status_data.get("stage")
+                    prog_str = status_data.get("progress_str")
+                    pct = status_data.get("percent")
+
+                    if curr_file:
+                        idx_str = f" [{file_idx}/{total_f}]" if file_idx and total_f else ""
+                        print(f"  * 当前处理{idx_str}: {curr_file}")
+                    if stage:
+                        print(f"  * 当前阶段: {stage}")
+                    if prog_str:
+                        pct_str = f" ({pct:.1f}%)" if pct is not None and f"({pct:.1f}%)" not in prog_str else ""
+                        print(f"  * 实时转码进度: {prog_str}{pct_str}")
+                except Exception:
+                    pass
+
             print(f"  * 运行主日志: {self.log_file}")
             print(f"  * 实时跟踪: tail -f {self.log_file}")
             print(f"  * 停止命令: {self.tool_name} --stop")
@@ -384,13 +452,14 @@ class DaemonManager:
             if self.log_file.exists():
                 print(f"  * 历史运行日志: {self.log_file}")
 
-        # 打印最近 15 行日志
+        # 打印最近 15 行实质性运行日志
         if self.log_file.exists():
             print("-" * 72)
             print(f"[最新日志动态 (最后 15 行)]: {self.log_file}")
             try:
                 with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
-                    lines = deque(f, maxlen=15)
+                    all_lines = [l for l in f if l.strip()]
+                    lines = all_lines[-15:]
                 for line in lines:
                     sys.stdout.write(f"  {line}")
                 if lines and not lines[-1].endswith("\n"):
@@ -414,6 +483,10 @@ class DaemonManager:
         if not pid or not self.is_pid_alive(pid):
             try:
                 self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                self.status_file.unlink(missing_ok=True)
             except Exception:
                 pass
             print(f"[提示] 进程 {pid if pid else ''} 已不在运行，已清理残留的任务状态。")
@@ -448,6 +521,10 @@ class DaemonManager:
 
         try:
             self.pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            self.status_file.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -575,11 +652,16 @@ class DaemonManager:
         except Exception as e:
             sys.stderr.write(f"[警告] 重定向 I/O 失败: {e}\n")
 
-        # 注册进程正常退出时清理 PID
+        # 注册进程正常退出时清理 PID 与状态文件
         def cleanup_pid():
             try:
                 if self.pid_file.exists():
                     self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                if self.status_file.exists():
+                    self.status_file.unlink(missing_ok=True)
             except Exception:
                 pass
 

@@ -271,6 +271,7 @@ class _EmbeddedDaemonManager:
         self.tool_name = tool_name
         self.base_dir = Path(base_dir).expanduser().resolve() if base_dir else (Path.home() / ".vfix")
         self.pid_file = self.base_dir / f"{tool_name}.pid"
+        self.status_file = self.base_dir / f"{tool_name}_status.json"
         self.log_file = Path(log_file).expanduser().resolve() if log_file else (self.base_dir / "logs" / f"{tool_name}.log")
 
     def is_pid_alive(self, pid: int) -> bool:
@@ -295,9 +296,52 @@ class _EmbeddedDaemonManager:
                 self.pid_file.unlink(missing_ok=True)
             except Exception:
                 pass
+            try:
+                self.status_file.unlink(missing_ok=True)
+            except Exception:
+                pass
             return None
         except Exception:
             return None
+
+    def update_status(
+        self,
+        current_file: Optional[Union[str, Path]] = None,
+        file_index: Optional[int] = None,
+        total_files: Optional[int] = None,
+        stage: Optional[str] = None,
+        progress_str: Optional[str] = None,
+        percent: Optional[float] = None
+    ) -> None:
+        """更新当前后台任务的实时进度快照，供 --status 即刻查询"""
+        try:
+            status_data = {}
+            if self.status_file.exists():
+                try:
+                    with open(self.status_file, "r", encoding="utf-8") as f:
+                        status_data = json.load(f)
+                except Exception:
+                    status_data = {}
+
+            if current_file is not None:
+                status_data["current_file"] = str(Path(current_file).resolve())
+            if file_index is not None:
+                status_data["file_index"] = file_index
+            if total_files is not None:
+                status_data["total_files"] = total_files
+            if stage is not None:
+                status_data["stage"] = stage
+            if progress_str is not None:
+                status_data["progress_str"] = progress_str
+            if percent is not None:
+                status_data["percent"] = round(percent, 1)
+            status_data["updated_at"] = time.time()
+            status_data["updated_at_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            with open(self.status_file, "w", encoding="utf-8") as f:
+                json.dump(status_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def show_status(self) -> None:
         info = self.get_running_info()
@@ -317,6 +361,30 @@ class _EmbeddedDaemonManager:
             print(f"  * 任务总量: {info.get('file_count', '未知')} 个视频文件")
             if info.get("args"):
                 print(f"  * 运行指令: {' '.join(info['args'])}")
+
+            # 读取实时心跳与文件路径快照
+            if self.status_file.exists():
+                try:
+                    with open(self.status_file, "r", encoding="utf-8") as f:
+                        status_data = json.load(f)
+                    curr_file = status_data.get("current_file")
+                    file_idx = status_data.get("file_index")
+                    total_f = status_data.get("total_files") or info.get("file_count")
+                    stage = status_data.get("stage")
+                    prog_str = status_data.get("progress_str")
+                    pct = status_data.get("percent")
+
+                    if curr_file:
+                        idx_str = f" [{file_idx}/{total_f}]" if file_idx and total_f else ""
+                        print(f"  * 当前处理{idx_str}: {curr_file}")
+                    if stage:
+                        print(f"  * 当前阶段: {stage}")
+                    if prog_str:
+                        pct_str = f" ({pct:.1f}%)" if pct is not None and f"({pct:.1f}%)" not in prog_str else ""
+                        print(f"  * 实时转码进度: {prog_str}{pct_str}")
+                except Exception:
+                    pass
+
             print(f"  * 运行主日志: {self.log_file}")
             print(f"  * 实时跟踪: tail -f {self.log_file}")
             print(f"  * 停止命令: {self.tool_name} --stop")
@@ -325,12 +393,14 @@ class _EmbeddedDaemonManager:
             if self.log_file.exists():
                 print(f"  * 历史运行日志: {self.log_file}")
 
+        # 打印最近 15 行实质性运行日志
         if self.log_file.exists():
             print("-" * 72)
             print(f"[最新日志动态 (最后 15 行)]: {self.log_file}")
             try:
                 with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
-                    lines = deque(f, maxlen=15)
+                    all_lines = [l for l in f if l.strip()]
+                    lines = all_lines[-15:]
                 for line in lines:
                     sys.stdout.write(f"  {line}")
                 if lines and not lines[-1].endswith("\n"):
@@ -353,6 +423,10 @@ class _EmbeddedDaemonManager:
         if not pid or not self.is_pid_alive(pid):
             try:
                 self.pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                self.status_file.unlink(missing_ok=True)
             except Exception:
                 pass
             print(f"[提示] 进程 {pid if pid else ''} 已不在运行，已清理残留的任务状态。")
@@ -385,6 +459,10 @@ class _EmbeddedDaemonManager:
 
         try:
             self.pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            self.status_file.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -512,6 +590,11 @@ class _EmbeddedDaemonManager:
                     self.pid_file.unlink(missing_ok=True)
             except Exception:
                 pass
+            try:
+                if self.status_file.exists():
+                    self.status_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         atexit.register(cleanup_pid)
 
@@ -545,6 +628,9 @@ if not hasattr(vlog, "setup_logger"):
     vlog = _EmbeddedVideoLogger()
 if DaemonManager is None:
     DaemonManager = _EmbeddedDaemonManager
+
+# 全局守护管理器句柄
+DAEMON_MGR: Optional[Any] = None
 
 # 常见视频后缀
 SUPPORTED_VIDEO_EXTENSIONS = {
@@ -928,19 +1014,19 @@ def remove_source_files(
         is_dir_output = True
         sub_videos = [f for f in final_output.glob("*") if f.is_file() and f.stat().st_size > 0]
         if not sub_videos:
-            print(f"  * [安全熔断拦截] 切片目录为空或无有效分段视频 ({final_output})，绝对禁止删除源文件！", file=sys.stderr)
+            print(f"  * [安全熔断拦截] 切片目录为空或无有效分段视频 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
         out_dur = 0.0
         out_size = sum(f.stat().st_size for f in sub_videos)
     else:
         if not final_output.exists() or final_output.stat().st_size <= 0:
-            print(f"  * [安全熔断拦截] 目标输出文件不存在或为空 ({final_output.name})，绝对禁止删除源文件！", file=sys.stderr)
+            print(f"  * [安全熔断拦截] 目标输出文件不存在或为空 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
 
         # 深度前置探针：验证目标产物的有效性
         out_info = probe_video(final_output)
         if not out_info or not out_info.get("width"):
-            print(f"  * [安全熔断拦截] 目标输出文件无有效视频画面流 ({final_output.name})，绝对禁止删除源文件！", file=sys.stderr)
+            print(f"  * [安全熔断拦截] 目标输出文件无有效视频画面流 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
 
         out_dur = out_info.get("duration", 0.0)
@@ -952,7 +1038,7 @@ def remove_source_files(
                 continue
             s_res = s.resolve()
             if final_res is not None and s_res == final_res:
-                print(f"  * [源文件清理跳过] 源文件与输出文件路径相同，已保护: {s.name}")
+                print(f"  * [源文件清理跳过] 源文件与输出文件路径相同，已保护: {s_res}")
                 continue
 
             s_size = s.stat().st_size
@@ -971,7 +1057,7 @@ def remove_source_files(
                             f"产物仅 {out_dur:.1f}s ({out_dur/60:.1f}m) "
                             f"(丢失 {(s_dur - out_dur):.1f}s, 缺失率 {((s_dur - out_dur) / s_dur * 100):.1f}%)"
                         )
-                        print(f"  * [致命安全拦截] {err_msg}！绝对禁止删除源文件: {s.name}", file=sys.stderr)
+                        print(f"  * [致命安全拦截] {err_msg}！绝对禁止删除源文件: {s_res}", file=sys.stderr)
                         if vlog:
                             vlog.log_deleted(
                                 deleted_file=s,
@@ -987,7 +1073,7 @@ def remove_source_files(
                 if s_size > 20 * 1024 * 1024 and out_size < (s_size * 0.10) and (s_dur > 30.0 or s_size > 50 * 1024 * 1024):
                     if out_dur < (s_dur * 0.90) if s_dur > 0 else True:
                         err_msg = f"产物体积异常暴跌 ({format_bytes(out_size)} vs 原文件 {format_bytes(s_size)}, 降幅超 90%) 且时长存疑"
-                        print(f"  * [致命安全拦截] {err_msg}！疑似破损截断残片，绝对禁止删除源文件: {s.name}", file=sys.stderr)
+                        print(f"  * [致命安全拦截] {err_msg}！疑似破损截断残片，绝对禁止删除源文件: {s_res}", file=sys.stderr)
                         if vlog:
                             vlog.log_deleted(
                                 deleted_file=s,
@@ -1009,7 +1095,7 @@ def remove_source_files(
                     status="DELETED",
                     tool=tool
                 )
-            print(f"  * [源文件清理] 已安全删除源文件: {s.name} ({format_bytes(s_size)}, 已记录至 deleted.log)")
+            print(f"  * [源文件清理] 已安全删除源文件: {s_res} ({format_bytes(s_size)}, 已记录至 deleted.log)")
         except Exception as e:
             if vlog:
                 vlog.log_deleted(
@@ -1021,7 +1107,7 @@ def remove_source_files(
                     error_msg=str(e),
                     tool=tool
                 )
-            print(f"  * [警告] 删除源文件失败 ({s.name}): {e}", file=sys.stderr)
+            print(f"  * [警告] 删除源文件失败 ({s.resolve()}): {e}", file=sys.stderr)
 
 
 def parse_aspect_ratio(aspect_str: Optional[str]) -> Optional[float]:
@@ -1398,9 +1484,15 @@ def setup_signal_handlers():
         pass
 
 
-def execute_ffmpeg_with_progress(cmd: List[str], duration: float) -> Tuple[bool, str]:
-    """执行 FFmpeg 并在控制台实时刷新显示转码进度。"""
-    global CURRENT_ACTIVE_PROCESS
+def execute_ffmpeg_with_progress(
+    cmd: List[str],
+    duration: float = 0.0,
+    current_file: Optional[Union[str, Path]] = None,
+    current_idx: Optional[int] = None,
+    total_files: Optional[int] = None
+) -> Tuple[bool, str]:
+    """执行 FFmpeg 并在控制台实时刷新显示转码进度，日志中采用里程碑记录避免重复刷屏。"""
+    global CURRENT_ACTIVE_PROCESS, DAEMON_MGR
     full_cmd = [cmd[0]] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
     try:
         proc = subprocess.Popen(
@@ -1427,7 +1519,9 @@ def execute_ffmpeg_with_progress(cmd: List[str], duration: float) -> Tuple[bool,
         last_time = ""
         last_speed = ""
         last_fps = ""
-        last_progress_print_time = 0.0
+        last_milestone_pct = -1
+        last_non_tty_print_time = 0.0
+        last_status_update_time = 0.0
         is_tty = sys.stdout.isatty()
 
         for line in proc.stdout:
@@ -1440,34 +1534,72 @@ def execute_ffmpeg_with_progress(cmd: List[str], duration: float) -> Tuple[bool,
                 last_fps = line.split("=")[1].strip()
             elif line.startswith("progress="):
                 if last_time:
-                    pct_str = ""
+                    cur_time = time.time()
+                    pct = None
+                    curr_sec = 0.0
                     if duration > 0:
                         try:
-                            # 格式化 "00:01:23" 为秒数
                             parts = last_time.split(":")
                             curr_sec = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
                             pct = min(100.0, max(0.0, (curr_sec / duration) * 100))
-                            pct_str = f" ({pct:.1f}%)"
                         except Exception:
-                            pct_str = ""
+                            pct = None
 
-                    cur_time = time.time()
+                    pct_str = f" ({pct:.1f}%)" if pct is not None else ""
+                    info_str = f"已编码时间: {last_time}{pct_str} | 速度: {last_speed} | 帧率: {last_fps} fps"
+
+                    # 1. 实时向后台守护状态文件写入心跳快照 (供 vcrop --status 随时高频查看最新进度，间隔 >= 1.5s)
+                    if DAEMON_MGR and (cur_time - last_status_update_time >= 1.5):
+                        DAEMON_MGR.update_status(
+                            current_file=current_file,
+                            file_index=current_idx,
+                            total_files=total_files,
+                            stage="裁剪转码中",
+                            progress_str=f"已编码: {last_time} | 速度: {last_speed} | 帧率: {last_fps} fps",
+                            percent=pct
+                        )
+                        last_status_update_time = cur_time
+
+                    # 2. 控制台与日志输出控制
                     if is_tty:
-                        sys.stdout.write(f"\r  [处理进度] 已编码时间: {last_time}{pct_str} | 速度: {last_speed} | 帧率: {last_fps} fps")
+                        # 交互式终端：\r 原地刷新单行
+                        sys.stdout.write(f"\r  [处理进度] {info_str}")
                         sys.stdout.flush()
                     else:
-                        if cur_time - last_progress_print_time >= 4.0:
-                            sys.stdout.write(f"  [处理进度] 已编码时间: {last_time}{pct_str} | 速度: {last_speed} | 帧率: {last_fps} fps\n")
+                        # 非终端（后台脱机运行 / 重定向至日志文件）：
+                        # 严禁每 4 秒重复输出导致日志海量刷屏！
+                        # 仅在跨越 10% 进度里程碑时输出一行；若未知时长则至多每 60 秒记录一行
+                        should_log = False
+                        milestone_label = ""
+                        if pct is not None:
+                            curr_bucket = int(pct // 10) * 10
+                            if curr_bucket > last_milestone_pct and curr_bucket > 0:
+                                should_log = True
+                                milestone_label = f" [{curr_bucket}%]"
+                                last_milestone_pct = curr_bucket
+                        else:
+                            if cur_time - last_non_tty_print_time >= 60.0:
+                                should_log = True
+                                last_non_tty_print_time = cur_time
+
+                        if should_log:
+                            sys.stdout.write(f"  [处理进度{milestone_label}] {info_str}\n")
                             sys.stdout.flush()
-                            last_progress_print_time = cur_time
 
         proc.wait()
         stderr_thread.join(timeout=2.0)
 
-        if last_time:
-            if is_tty:
-                sys.stdout.write("\n")
+        if last_time and is_tty:
+            sys.stdout.write("\n")
             sys.stdout.flush()
+
+        if DAEMON_MGR:
+            DAEMON_MGR.update_status(
+                current_file=current_file,
+                file_index=current_idx,
+                total_files=total_files,
+                stage="转码完成，正在封装校验" if proc.returncode == 0 else "转码异常终止"
+            )
 
         if proc.returncode != 0:
             err_msg = "\n".join(last_stderr_lines)
@@ -1964,7 +2096,13 @@ def process_video_with_splits(
         ]
 
         t_part_start = time.time()
-        success, err_msg = execute_ffmpeg_with_progress(cmd, seg_dur)
+        success, err_msg = execute_ffmpeg_with_progress(
+            cmd,
+            seg_dur,
+            current_file=final_part_path,
+            current_idx=idx,
+            total_files=len(segments)
+        )
 
         # 音频 copy 若在切片边界异常，回退 aac
         if not success and audio_mode == "copy":
@@ -1982,7 +2120,13 @@ def process_video_with_splits(
                 "-map", "0:v:0",
                 "-map", "0:a?"
             ] + video_args + ["-c:a", "aac", "-b:a", "128k", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(temp_part_file)]
-            success, err_msg = execute_ffmpeg_with_progress(fallback_cmd, seg_dur)
+            success, err_msg = execute_ffmpeg_with_progress(
+                fallback_cmd,
+                seg_dur,
+                current_file=final_part_path,
+                current_idx=idx,
+                total_files=len(segments)
+            )
 
         if not success or not temp_part_file.exists() or temp_part_file.stat().st_size == 0:
             print(f"  [错误] 分段 {idx} 转码失败: {err_msg}", file=sys.stderr)
@@ -1994,14 +2138,14 @@ def process_video_with_splits(
         total_written_bytes += part_size
         safe_move_file(temp_part_file, final_part_path)
         t_part_cost = time.time() - t_part_start
-        print(f"  * [完成] 分段 {idx} 裁剪成功! 耗时: {t_part_cost:.1f}s | 大小: {format_bytes(part_size)} | 导出路径: {final_part_path.name}")
+        print(f"  * [完成] 分段 {idx} 裁剪成功! 耗时: {t_part_cost:.1f}s | 大小: {format_bytes(part_size)} | 导出路径: {final_part_path.resolve()}")
         success_segments += 1
 
     total_cost = time.time() - t_start_all
     print(f"\n===========================================================================")
     print(f"[智能切片总结] 全部处理完成! 成功切片: {success_segments}/{len(segments)} 个 | 总耗时: {total_cost:.1f}s")
     print(f"  * 原始单文件: {format_bytes(orig_size)} -> 分段总大小: {format_bytes(total_written_bytes)}")
-    print(f"  * 所有切片视频已汇总存放至: {segments_dir}")
+    print(f"  * 所有切片视频已汇总存放至: {segments_dir.resolve()}")
 
     is_all_ok = (success_segments == len(segments))
     if vlog:
@@ -2046,12 +2190,20 @@ def process_single_video(
     min_segment_duration: float = 12.0,
     scan_step: Optional[float] = None,
     drop_ads: bool = False,
-    max_ad_duration: float = 120.0
+    max_ad_duration: float = 120.0,
+    current_idx: int = 1,
+    total_files: int = 1
 ) -> bool:
     """处理单个视频的黑边检测与裁剪输出。"""
     print(f"\n{'='*75}")
-    print(f"[视频文件] {file_path.name}")
-    print(f"  * 完整路径: {file_path.resolve()}")
+    print(f"[处理中] [{current_idx}/{total_files}] 文件: {file_path.resolve()}")
+    if DAEMON_MGR:
+        DAEMON_MGR.update_status(
+            current_file=file_path,
+            file_index=current_idx,
+            total_files=total_files,
+            stage="元数据探测与黑边分析"
+        )
     orig_size = file_path.stat().st_size
     print(f"  * 原始大小: {format_bytes(orig_size)}")
 
@@ -2377,9 +2529,15 @@ def process_single_video(
         str(temp_output_file)
     ]
 
-    print(f"  * 开始裁剪转码 -> 目标文件: {output_file.name}")
+    print(f"  * 开始裁剪转码 -> 目标文件: {output_file.resolve()}")
     t_start = time.time()
-    success, err_msg = execute_ffmpeg_with_progress(cmd, duration)
+    success, err_msg = execute_ffmpeg_with_progress(
+        cmd,
+        duration,
+        current_file=file_path,
+        current_idx=current_idx,
+        total_files=total_files
+    )
     elapsed = time.time() - t_start
 
     # === 核心安全防线：全方位产物完整性与时长截断核验 ===
@@ -2438,7 +2596,13 @@ def process_single_video(
             "-movflags", "+faststart",
             str(temp_output_file)
         ]
-        success, err_msg = execute_ffmpeg_with_progress(cmd_sw, duration)
+        success, err_msg = execute_ffmpeg_with_progress(
+            cmd_sw,
+            duration,
+            current_file=file_path,
+            current_idx=current_idx,
+            total_files=total_files
+        )
         is_truncated = False
         if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
             out_probe = probe_video(temp_output_file)
@@ -2483,7 +2647,7 @@ def process_single_video(
     safe_move_file(temp_output_file, output_file)
 
     print(f"\n[完成] 裁剪成功! 耗时: {elapsed:.1f}s")
-    print(f"  * 最终输出: {output_file}")
+    print(f"  * 最终输出: {output_file.resolve()}")
     print(f"  * 文件大小: {format_bytes(orig_size)} -> {format_bytes(new_size)} ({size_diff:+.1f}%)")
     if vlog:
         vlog.log_processed(
@@ -2850,8 +3014,10 @@ def main():
     norm_argv = normalize_cli_args(sys.argv[1:])
     args = parser.parse_args(norm_argv)
 
+    global DAEMON_MGR
     vlog.setup_logger(log_dir=args.log_dir, enabled=not args.no_log, tool_name="vcrop")
     daemon_mgr = DaemonManager(tool_name="vcrop", log_file=vlog.get_main_log_path())
+    DAEMON_MGR = daemon_mgr
 
     # 优先响应后台任务管理指令 (--status / --stop)
     if args.status:
@@ -2926,7 +3092,7 @@ def main():
     fail_count = 0
 
     for idx, video_path in enumerate(video_files, 1):
-        print(f"\n>> 正在处理 [{idx}/{len(video_files)}]: {video_path.name}")
+        print(f"\n>> 正在处理 [{idx}/{len(video_files)}]: {video_path.resolve()}")
         try:
             ok = process_single_video(
                 file_path=video_path,
@@ -2950,7 +3116,9 @@ def main():
                 min_segment_duration=args.min_segment_duration,
                 scan_step=args.scan_step,
                 drop_ads=args.drop_ads,
-                max_ad_duration=args.max_ad_duration
+                max_ad_duration=args.max_ad_duration,
+                current_idx=idx,
+                total_files=len(video_files)
             )
             if ok:
                 success_count += 1
@@ -2966,6 +3134,11 @@ def main():
     total_cost = time.time() - session_start_time
     if vlog:
         vlog.log_session_end(success_count, fail_count, total_cost, tool="vcrop")
+    if DAEMON_MGR:
+        DAEMON_MGR.update_status(
+            stage="任务全部完成",
+            progress_str=f"共完成 {success_count}/{len(video_files)} 个视频"
+        )
 
     print(f"\n{'='*75}")
     print(f"[处理总结] 全部文件处理完成: 成功 {success_count} 个, 失败/异常 {fail_count} 个。")
