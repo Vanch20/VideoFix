@@ -2260,7 +2260,7 @@ def process_video(
             "-loglevel", "error",
             "-max_error_rate", "1.0",
             "-err_detect", "ignore_err",
-            "-fflags", "+discardcorrupt",
+            "-fflags", "+discardcorrupt+genpts",
             "-i", str(file_path),
             "-max_muxing_queue_size", "2048"
         ]
@@ -2300,6 +2300,18 @@ def process_video(
                         "-max_muxing_queue_size", "2048"
                     ]
                 )
+                sw_base_args = [
+                    "ffmpeg", "-y",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-max_error_rate", "1.0",
+                    "-err_detect", "ignore_err",
+                    "-fflags", "+discardcorrupt+genpts",
+                    "-i", str(file_path),
+                    "-err_detect", "ignore_err",
+                    "-i", str(salvaged_audio_file),
+                    "-max_muxing_queue_size", "2048"
+                ]
                 map_args = ["-map", "0:v:0", "-map", "1:a:0"]
                 audio_args = ["-c:a", "copy"]
             else:
@@ -2482,16 +2494,11 @@ def process_video(
                 width=target_w,
                 height=target_h
             )
-            cmd_sw_fallback = (
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
-                 "-err_detect", "ignore_err", "-fflags", "+discardcorrupt+genpts"]
-                + get_input_args(file_path, info.get("codec", ""))
-                + map_args + vf_fix_args + fallback_video_args + audio_args + [
-                    "-avoid_negative_ts", "make_zero",
-                    "-movflags", "+faststart",
-                    str(temp_output_file)
-                ]
-            )
+            cmd_sw_fallback = sw_base_args + map_args + vf_fix_args + fallback_video_args + audio_args + [
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(temp_output_file)
+            ]
             success, last_err_msg = execute_ffmpeg(
                 cmd_sw_fallback,
                 duration=duration,
