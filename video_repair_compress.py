@@ -2661,8 +2661,8 @@ def process_video(
         if not need_compress:
             # === 仅修复/无损换封装模式：尝试极速流复制 ===
             if salvaged_src_file and salvaged_src_file.exists():
-                print(f"  * 抢救重构产物已为标准高兼容 MP4，直接执行原子归档: {output_name}")
-                safe_move_file(salvaged_src_file, final_output_file)
+                print(f"  * 抢救重构产物已为标准高兼容 MP4，准备归档: {output_name}")
+                safe_move_file(salvaged_src_file, temp_output_file)
                 success = True
                 salvaged_src_file = None
             else:
@@ -2866,8 +2866,8 @@ def process_video(
             if salvage_corrupted_mp4(file_path, salvaged_candidate):
                 salvaged_src_file = salvaged_candidate
                 if not need_compress:
-                    print(f"  * 抢救重构产物已为标准高兼容 MP4，直接执行原子归档: {output_name}")
-                    safe_move_file(salvaged_src_file, final_output_file)
+                    print(f"  * 抢救重构产物已为标准高兼容 MP4，准备归档: {output_name}")
+                    safe_move_file(salvaged_src_file, temp_output_file)
                     success = True
                     salvaged_src_file = None
                 else:
