@@ -35,6 +35,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1399,6 +1400,317 @@ def extract_vorbis_acm_audio(file_path: Path, out_aac_path: Path, target_kbps: i
     return p_enc.returncode == 0 and out_aac_path.exists() and out_aac_path.stat().st_size > 0
 
 
+def split_annexb_nals(data: bytes) -> List[bytes]:
+    """将 Annex-B 字节流按照 00 00 01 或 00 00 00 01 规范切分为独立的 NAL 单元。"""
+    nals = []
+    pos = 0
+    n = len(data)
+    start_offsets = []
+    while pos < n:
+        if pos + 4 <= n and data[pos : pos + 4] == b"\x00\x00\x00\x01":
+            start_offsets.append((pos, 4))
+            pos += 4
+        elif pos + 3 <= n and data[pos : pos + 3] == b"\x00\x00\x01":
+            start_offsets.append((pos, 3))
+            pos += 3
+        else:
+            pos += 1
+    for i in range(len(start_offsets)):
+        curr_start, prefix_len = start_offsets[i]
+        nal_start = curr_start + prefix_len
+        nal_end = start_offsets[i + 1][0] if i + 1 < len(start_offsets) else n
+        nal = data[nal_start:nal_end].rstrip(b"\x00")
+        if nal:
+            nals.append(nal)
+    return nals
+
+
+def detect_h264_sps_pps_for_idr(idr_data: bytes, sei_data: Optional[bytes] = None) -> Tuple[Optional[int], Optional[int], Optional[bytes]]:
+    """根据首个 IDR 关键帧与 SEI 逆向探测并生成匹配的 H.264 SPS & PPS 头部。
+    毫秒级穷举常见分辨率，经 FFmpeg 解码器真实零报错验证后返回 (width, height, sps_pps_annexb)。
+    """
+    cabac = 0
+    ref = 1
+    bframes = 0
+    if sei_data:
+        s_text = sei_data.decode("latin1", errors="ignore")
+        if "cabac=1" in s_text:
+            cabac = 1
+        if "bframes=" in s_text:
+            m = re.search(r"bframes=(\d+)", s_text)
+            if m:
+                bframes = int(m.group(1))
+        if "ref=" in s_text:
+            m = re.search(r"ref=(\d+)", s_text)
+            if m:
+                ref = int(m.group(1))
+
+    candidates = [
+        (1280, 720), (1920, 1080), (854, 480), (848, 480), (720, 480),
+        (640, 480), (960, 540), (1024, 576), (720, 576), (1280, 960),
+        (1440, 1080), (1600, 900), (640, 360), (480, 320), (320, 240)
+    ]
+
+    START = b"\x00\x00\x00\x01"
+    temp_dir = Path(tempfile.gettempdir())
+    probe_gen = temp_dir / f"_vfix_probe_gen_{os.getpid()}.h264"
+    probe_test = temp_dir / f"_vfix_probe_test_{os.getpid()}.h264"
+
+    try:
+        for w, h in candidates:
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"color=s={w}x{h}:d=0.04:r=30",
+                "-c:v", "libx264", "-preset", "ultrafast", "-qp", "23",
+                "-x264-params", f"cabac={cabac}:ref={ref}:bframes={bframes}:keyint=250:keyint_min=25:scenecut=0",
+                "-f", "h264", str(probe_gen)
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not probe_gen.exists() or probe_gen.stat().st_size == 0:
+                continue
+            with open(probe_gen, "rb") as f:
+                gen_data = f.read(1024)
+
+            nals = split_annexb_nals(gen_data)
+            sps_nal = next((n for n in nals if (n[0] & 0x1f) == 7), None)
+            pps_nal = next((n for n in nals if (n[0] & 0x1f) == 8), None)
+            if not sps_nal or not pps_nal:
+                continue
+
+            probe_stream = START + sps_nal + START + pps_nal + START + idr_data
+            with open(probe_test, "wb") as f:
+                f.write(probe_stream)
+
+            r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(probe_test), "-f", "null", "-"], capture_output=True, text=True)
+            if not r.stderr.strip():
+                return w, h, (START + sps_nal + START + pps_nal)
+    finally:
+        for p in (probe_gen, probe_test):
+            if p.exists():
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return None, None, None
+
+
+def salvage_corrupted_mp4(file_path: Path, output_file: Path) -> bool:
+    """针对头部/索引损毁（如 moov 丢失、含全零空洞的 .part、下载未完成文件）的 MP4/MOV 实施深度底层裸流抢救：
+    1. 扫描文件寻找残存的 stco / stsz / stsc 及 audio trak 索引；
+    2. 提取并验证首个 IDR 关键帧，毫秒级逆向推导出精准分辨率与 SPS/PPS 参数；
+    3. 采用单遍流式线性扫描 (8MB 缓存)，将 H.264 视频帧与 AAC 音频包极速分离并注入标准头；
+    4. 交由 FFmpeg 原生 -c copy 无损封装为标准带有 faststart 索引头的完好 MP4；
+    5. 成功返回 True，失败返回 False。
+    """
+    t0 = time.time()
+    file_size = file_path.stat().st_size
+    if file_size < 1024:
+        return False
+
+    scan_len = min(file_size, 35 * 1024 * 1024)
+    with open(file_path, "rb") as f:
+        f.seek(file_size - scan_len)
+        tail_data = f.read(scan_len)
+        tail_base = file_size - scan_len
+
+        # 1. 扫描有效 stco 表
+        stco_tables = []
+        idx = 0
+        while True:
+            p = tail_data.find(b"stco", idx)
+            if p == -1:
+                break
+            abs_p = tail_base + p
+            if p >= 4:
+                atom_size = int.from_bytes(tail_data[p-4:p], "big")
+                entry_count = int.from_bytes(tail_data[p+8:p+12], "big")
+                if 10 < entry_count < 5000000 and atom_size == 16 + entry_count * 4:
+                    stco_tables.append((abs_p - 4, entry_count, atom_size))
+            idx = p + 1
+
+        # 2. 扫描 audio trak
+        audio_trak_info = None
+        idx = 0
+        while True:
+            p = tail_data.find(b"trak", idx)
+            if p == -1:
+                break
+            abs_p = tail_base + p
+            if p >= 4:
+                atom_size = int.from_bytes(tail_data[p-4:p], "big")
+                trak_bytes = tail_data[p-4 : min(len(tail_data), p-4+atom_size)]
+                if b"soun" in trak_bytes or b"smhd" in trak_bytes or b"mp4a" in trak_bytes:
+                    audio_trak_info = (abs_p - 4, atom_size, trak_bytes)
+            idx = p + 1
+
+        if not stco_tables:
+            return False
+
+        # 区分音频 stco 与视频 stco
+        audio_stco_offset = None
+        if audio_trak_info:
+            a_start, a_size, a_bytes = audio_trak_info
+            for off, cnt, sz in stco_tables:
+                if a_start <= off < a_start + a_size:
+                    audio_stco_offset = off
+                    break
+
+        video_stco = next((item for item in stco_tables if item[0] != audio_stco_offset), None)
+        if not video_stco:
+            return False
+
+        v_stco_off, v_count, _ = video_stco
+        f.seek(v_stco_off + 16)
+        v_offsets = struct.unpack(f">{v_count}I", f.read(v_count * 4))
+
+        # 解析音频帧及索引
+        a_sample_offsets = []
+        sample_rate = 44100
+        channels = 2
+        if audio_trak_info:
+            a_start, a_size, a_bytes = audio_trak_info
+            p_mp4a = a_bytes.find(b"mp4a")
+            if p_mp4a != -1 and p_mp4a + 26 <= len(a_bytes):
+                channels = int.from_bytes(a_bytes[p_mp4a+16:p_mp4a+18], "big") or 2
+                sample_rate = int.from_bytes(a_bytes[p_mp4a+24:p_mp4a+26], "big") or 44100
+
+            p_stsz = a_bytes.find(b"stsz")
+            p_stsc = a_bytes.find(b"stsc")
+            p_stco = a_bytes.find(b"stco")
+            if p_stsz != -1 and p_stsc != -1 and p_stco != -1:
+                a_count = int.from_bytes(a_bytes[p_stsz+12:p_stsz+16], "big")
+                if 0 < a_count < 5000000:
+                    a_sizes = struct.unpack(f">{a_count}I", a_bytes[p_stsz+16 : p_stsz+16 + a_count*4])
+                    a_co_count = int.from_bytes(a_bytes[p_stco+8:p_stco+12], "big")
+                    a_chunk_offsets = struct.unpack(f">{a_co_count}I", a_bytes[p_stco+12 : p_stco+12 + a_co_count*4])
+                    sc_count = int.from_bytes(a_bytes[p_stsc+8:p_stsc+12], "big")
+                    stsc_entries = [struct.unpack(">III", a_bytes[p_stsc+12+i*12 : p_stsc+12+(i+1)*12]) for i in range(sc_count)]
+
+                    curr_stsc_idx = 0
+                    sample_idx = 0
+                    for chunk_idx in range(len(a_chunk_offsets)):
+                        chunk_num = chunk_idx + 1
+                        if curr_stsc_idx + 1 < len(stsc_entries) and chunk_num >= stsc_entries[curr_stsc_idx + 1][0]:
+                            curr_stsc_idx += 1
+                        spc = stsc_entries[curr_stsc_idx][1]
+                        offset = a_chunk_offsets[chunk_idx]
+                        for s in range(spc):
+                            if sample_idx >= a_count:
+                                break
+                            a_sample_offsets.append((offset, a_sizes[sample_idx]))
+                            offset += a_sizes[sample_idx]
+                            sample_idx += 1
+                        if sample_idx >= a_count:
+                            break
+
+        # 3. 读取首个 IDR 关键帧与 SEI 逆向解析视频参数
+        idr = None
+        sei = None
+        for try_chunk_idx in range(min(5, len(v_offsets))):
+            f.seek(v_offsets[try_chunk_idx])
+            chunk_head = f.read(256 * 1024)
+            c_pos = 0
+            while c_pos + 4 <= len(chunk_head):
+                n_len = int.from_bytes(chunk_head[c_pos : c_pos + 4], "big")
+                c_pos += 4
+                if n_len == 0 or c_pos + n_len > len(chunk_head):
+                    break
+                nal = chunk_head[c_pos : c_pos + n_len]
+                c_pos += n_len
+                ntype = nal[0] & 0x1f
+                if ntype == 6 and not sei:
+                    sei = nal
+                elif ntype == 5 and not idr:
+                    idr = nal
+                    break
+            if idr:
+                break
+
+        if not idr:
+            return False
+
+        w, h, sps_pps = detect_h264_sps_pps_for_idr(idr, sei)
+        if not sps_pps:
+            return False
+
+        # 4. 流式提取音视频并重构 Annex-B / ADTS
+        valid_v = [off for off in v_offsets if 0 < off < file_size - 4]
+        valid_a = [(off, sz) for off, sz in a_sample_offsets if 0 < off < file_size - sz]
+
+        events = [(off, "V", 0) for off in valid_v]
+        events.extend([(off, "A", sz) for off, sz in valid_a])
+        events.sort(key=lambda x: x[0])
+
+        temp_dir = Path(tempfile.gettempdir())
+        temp_v = temp_dir / f"_vfix_stream_{os.getpid()}.h264"
+        temp_a = temp_dir / f"_vfix_stream_{os.getpid()}.aac"
+
+        START_CODE = b"\x00\x00\x00\x01"
+        freq_map = {96000:0, 88200:1, 64000:2, 48000:3, 44100:4, 32000:5, 24000:6, 22050:7, 16000:8, 12000:9, 11025:10, 8000:11}
+        freq_idx = freq_map.get(sample_rate, 4)
+        ch_cfg = channels & 7
+
+        try:
+            with open(file_path, "rb", buffering=8*1024*1024) as f_in, \
+                 open(temp_v, "wb", buffering=8*1024*1024) as f_v, \
+                 open(temp_a, "wb", buffering=8*1024*1024) as f_a:
+                f_v.write(sps_pps)
+                n_events = len(events)
+                for i, (off, kind, sz) in enumerate(events):
+                    f_in.seek(off)
+                    if kind == "V":
+                        next_off = events[i+1][0] if i+1 < n_events else off + 1048576
+                        chunk_len = max(0, min(next_off - off, 10 * 1024 * 1024))
+                        chunk_data = f_in.read(chunk_len)
+                        c_pos = 0
+                        while c_pos + 4 <= len(chunk_data):
+                            n_len = int.from_bytes(chunk_data[c_pos:c_pos+4], "big")
+                            c_pos += 4
+                            if n_len == 0 or c_pos + n_len > len(chunk_data):
+                                break
+                            nal = chunk_data[c_pos:c_pos+n_len]
+                            c_pos += n_len
+                            nal_type = nal[0] & 0x1f
+                            if nal_type not in (6, 9):
+                                f_v.write(START_CODE + nal)
+                    else:
+                        raw = f_in.read(sz)
+                        if len(raw) < sz or raw == b"\x00" * sz:
+                            continue
+                        flen = len(raw) + 7
+                        b0 = 0xFF; b1 = 0xF1
+                        b2 = (1 << 6) | (freq_idx << 2) | (ch_cfg >> 2)
+                        b3 = ((ch_cfg & 3) << 6) | (flen >> 11)
+                        b4 = (flen >> 3) & 0xFF
+                        b5 = ((flen & 7) << 5) | 0x1F
+                        b6 = 0xFC
+                        f_a.write(bytes([b0, b1, b2, b3, b4, b5, b6]) + raw)
+
+            # 5. FFmpeg 无损流拷贝封装并注入 faststart
+            cmd_mux = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-r", "30", "-i", str(temp_v)
+            ]
+            has_audio_out = temp_a.exists() and temp_a.stat().st_size > 0
+            if has_audio_out:
+                cmd_mux.extend(["-i", str(temp_a)])
+            cmd_mux.extend([
+                "-c", "copy", "-movflags", "+faststart",
+                str(output_file)
+            ])
+
+            r = subprocess.run(cmd_mux, capture_output=True, text=True)
+            return r.returncode == 0 and output_file.exists() and output_file.stat().st_size > 1024
+        finally:
+            for p in (temp_v, temp_a):
+                if p.exists():
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+
 def preflight_audio(file_path: Path, info_or_has_audio: Any = True) -> str:
     """
     极速预检（0.1 秒探测）音频轨道的可用性：
@@ -2002,7 +2314,19 @@ def process_video(
             stage="元数据探测与黑边分析"
         )
 
+    salvaged_src_file: Optional[Path] = None
     info = probe_video(file_path)
+    if not info or not info.get("width"):
+        print(f"  * [残缺救砖] 检测到容器头或索引严重损毁（常规解复用失败），启动 MP4/MOV 底层原子流提取抢救引擎...")
+        temp_dir = Path(tempfile.gettempdir())
+        clean_stem = get_clean_stem(file_path)
+        salvaged_candidate = temp_dir / f"vfix_salvaged_{os.getpid()}_{clean_stem}.mp4"
+        if salvage_corrupted_mp4(file_path, salvaged_candidate):
+            salvaged_src_file = salvaged_candidate
+            info = probe_video(salvaged_src_file)
+            if info and info.get("width"):
+                print(f"  * [残缺救砖] 成功抢救并重构标准 MP4 容器！(大小: {format_bytes(salvaged_src_file.stat().st_size)})")
+
     if not info:
         orig_size = file_path.stat().st_size
         print(f"  * 状态: 文件头/索引严重缺失（常见于 .part 残缺文件），启动深度容错修复...")
@@ -2011,7 +2335,7 @@ def process_video(
             "width": 1280, "height": 720, "fps": 30.0, "codec": "unknown", "has_audio": True
         }
     else:
-        orig_size = info["size"]
+        orig_size = file_path.stat().st_size
         orig_bitrate = info["bitrate"]
         orig_v_bitrate = info.get("video_bitrate", 0.0)
         orig_a_bitrate = info.get("audio_bitrate", 0.0)
@@ -2239,7 +2563,8 @@ def process_video(
         # -err_detect ignore_err: 解码时容忍并跳过损坏数据
         # -fflags +discardcorrupt: 容错丢弃不可恢复损坏包
         # -max_muxing_queue_size 2048: 防止音画错位导致队列溢出
-        hw_decode_args = get_hwaccel_decode_args(file_path, codec)
+        effective_input = salvaged_src_file if (salvaged_src_file and salvaged_src_file.exists()) else file_path
+        hw_decode_args = get_hwaccel_decode_args(effective_input, codec)
         base_args = (
             ["ffmpeg", "-y"]
             + hw_decode_args
@@ -2249,7 +2574,7 @@ def process_video(
                 "-max_error_rate", "1.0",
                 "-err_detect", "ignore_err",
                 "-fflags", "+discardcorrupt",
-                "-i", str(file_path),
+                "-i", str(effective_input),
                 "-max_muxing_queue_size", "2048"
             ]
         )
@@ -2261,12 +2586,12 @@ def process_video(
             "-max_error_rate", "1.0",
             "-err_detect", "ignore_err",
             "-fflags", "+discardcorrupt+genpts",
-            "-i", str(file_path),
+            "-i", str(effective_input),
             "-max_muxing_queue_size", "2048"
         ]
 
         # 音频预检与码率自适应：0.1 秒锁定正确的音频处理策略，并杜绝音频码率虚高膨胀
-        audio_mode = preflight_audio(file_path, info)
+        audio_mode = preflight_audio(effective_input, info)
         orig_audio_bps = info.get("audio_bitrate", 0.0)
         if orig_audio_bps > 0:
             # 原音频码率已知：绝不高转虚高（如 64k 原声绝不上浮至 128k），严格封顶在原音频码率以内
@@ -2335,18 +2660,24 @@ def process_video(
 
         if not need_compress:
             # === 仅修复/无损换封装模式：尝试极速流复制 ===
-            tag_args = ["-tag:v", "hvc1"] if codec in ("hevc", "h265") else []
-            cmd_copy = base_args + map_args + ["-c:v", "copy"] + tag_args + audio_args + [
-                "-movflags", "+faststart",
-                str(temp_output_file)
-            ]
-            success, last_err_msg = execute_ffmpeg(
-                cmd_copy,
-                duration=duration,
-                current_file=file_path,
-                current_idx=current_idx,
-                total_files=total_files
-            )
+            if salvaged_src_file and salvaged_src_file.exists():
+                print(f"  * 抢救重构产物已为标准高兼容 MP4，直接执行原子归档: {output_name}")
+                safe_move_file(salvaged_src_file, final_output_file)
+                success = True
+                salvaged_src_file = None
+            else:
+                tag_args = ["-tag:v", "hvc1"] if codec in ("hevc", "h265") else []
+                cmd_copy = base_args + map_args + ["-c:v", "copy"] + tag_args + audio_args + [
+                    "-movflags", "+faststart",
+                    str(temp_output_file)
+                ]
+                success, last_err_msg = execute_ffmpeg(
+                    cmd_copy,
+                    duration=duration,
+                    current_file=file_path,
+                    current_idx=current_idx,
+                    total_files=total_files
+                )
 
             fps_val = float(info.get("fps", 30.0) or 30.0)
             gop_size = max(15, int(fps_val * 2))
@@ -2527,6 +2858,36 @@ def process_video(
         if is_truncated:
             success = False
 
+        if not success and not salvaged_src_file and any(k in (last_err_msg or "").lower() for k in ["invalid data found", "moov atom not found", "error opening input"]):
+            print("  * [残缺救砖] 捕获到解复用器致命错误，自动启动 MP4/MOV 底层原子流提取抢救引擎...")
+            temp_dir = Path(tempfile.gettempdir())
+            clean_stem = get_clean_stem(file_path)
+            salvaged_candidate = temp_dir / f"vfix_salvaged_{os.getpid()}_{clean_stem}.mp4"
+            if salvage_corrupted_mp4(file_path, salvaged_candidate):
+                salvaged_src_file = salvaged_candidate
+                if not need_compress:
+                    print(f"  * 抢救重构产物已为标准高兼容 MP4，直接执行原子归档: {output_name}")
+                    safe_move_file(salvaged_src_file, final_output_file)
+                    success = True
+                    salvaged_src_file = None
+                else:
+                    cmd_retry = [
+                        "ffmpeg", "-y",
+                        "-hide_banner", "-loglevel", "error",
+                        "-i", str(salvaged_src_file)
+                    ] + map_args + vf_fix_args + video_encode_args + audio_args + [
+                        "-avoid_negative_ts", "make_zero",
+                        "-movflags", "+faststart",
+                        str(temp_output_file)
+                    ]
+                    success, last_err_msg = execute_ffmpeg(
+                        cmd_retry,
+                        duration=duration,
+                        current_file=file_path,
+                        current_idx=current_idx,
+                        total_files=total_files
+                    )
+
         if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
             new_size = temp_output_file.stat().st_size
 
@@ -2628,6 +2989,8 @@ def process_video(
             temp_output_file.unlink(missing_ok=True)
         if salvaged_audio_file and salvaged_audio_file.exists():
             salvaged_audio_file.unlink(missing_ok=True)
+        if salvaged_src_file and salvaged_src_file.exists():
+            salvaged_src_file.unlink(missing_ok=True)
 
 
 
