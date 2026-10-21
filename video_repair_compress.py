@@ -855,11 +855,32 @@ def get_clean_stem(file_path: Path) -> str:
 
     p = Path(name)
     stem = p.stem if p.suffix.lower() in BASE_VIDEO_EXTENSIONS else p.name
-    for action_suffix in ("_compressed", "_repaired", "_merged"):
+    for action_suffix in ("_compressed", "_repaired", "_merged", "_orig", "_origin"):
         if stem.lower().endswith(action_suffix):
             stem = stem[:-len(action_suffix)]
             break
     return stem
+
+
+def derive_backup_source_path(file_path: Path) -> Path:
+    """生成原文件的安全备份重命名路径 (如 movie.mp4 -> movie_orig.mp4)。若重名则自动递增序号。"""
+    parent = file_path.parent
+    name = file_path.name
+    clean_stem = get_clean_stem(file_path)
+    remainder = name[len(clean_stem):]
+    if not remainder.startswith((".", "_", "-")):
+        remainder = f"_{remainder}" if remainder else ".mp4"
+
+    candidate = parent / f"{clean_stem}_orig{remainder}"
+    if not candidate.exists():
+        return candidate
+
+    idx = 1
+    while True:
+        candidate = parent / f"{clean_stem}_orig_{idx}{remainder}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
 
 
 def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
@@ -1058,7 +1079,8 @@ def derive_merged_output_path(
     file_paths: List[Path],
     output_target: Optional[Path],
     is_compressed: bool = True,
-    default_ext: str = ".mp4"
+    default_ext: str = ".mp4",
+    keep_name: bool = False
 ) -> Path:
     """智能推导多分卷合并后的输出路径与文件名。"""
     clean_stems = [get_clean_stem(p) for p in file_paths]
@@ -1076,8 +1098,11 @@ def derive_merged_output_path(
     else:
         derived = common
 
-    tag = "_compressed" if is_compressed else ""
-    default_filename = f"{derived}_merged{tag}{default_ext}"
+    if keep_name:
+        default_filename = f"{derived}{default_ext}"
+    else:
+        tag = "_compressed" if is_compressed else ""
+        default_filename = f"{derived}_merged{tag}{default_ext}"
 
     if output_target is not None:
         if output_target.suffix.lower() in BASE_VIDEO_EXTENSIONS:
@@ -2168,7 +2193,9 @@ def remove_source_files(
     sources: List[Path],
     final_output: Path,
     reason: str = "源文件清理 (--delete-source)",
-    tool: str = "vfix"
+    tool: str = "vfix",
+    verify_file: Optional[Path] = None,
+    allow_same_as_output: bool = False
 ) -> None:
     """
     在视频处理或合并成功后安全删除源文件（具有最严密的安全熔断保护机制）：
@@ -2183,35 +2210,37 @@ def remove_source_files(
     except Exception:
         final_res = None
 
+    check_target = verify_file if (verify_file and verify_file.exists()) else final_output
+
     is_dir_output = False
-    if final_output.is_dir():
+    if check_target.is_dir():
         is_dir_output = True
-        sub_videos = [f for f in final_output.glob("*") if f.is_file() and f.stat().st_size > 0]
+        sub_videos = [f for f in check_target.glob("*") if f.is_file() and f.stat().st_size > 0]
         if not sub_videos:
-            print(f"  * [安全熔断拦截] 切片目录为空或无有效分段视频 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
+            print(f"  * [安全熔断拦截] 切片目录为空或无有效分段视频 ({check_target.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
         out_dur = 0.0
         out_size = sum(f.stat().st_size for f in sub_videos)
     else:
-        if not final_output.exists() or final_output.stat().st_size <= 0:
-            print(f"  * [安全熔断拦截] 目标输出文件不存在或为空 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
+        if not check_target.exists() or check_target.stat().st_size <= 0:
+            print(f"  * [安全熔断拦截] 目标输出文件不存在或为空 ({check_target.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
 
         # 深度前置探针：验证目标产物的有效性
-        out_info = probe_video(final_output)
+        out_info = probe_video(check_target)
         if not out_info or not out_info.get("width"):
-            print(f"  * [安全熔断拦截] 目标输出文件无有效视频画面流 ({final_output.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
+            print(f"  * [安全熔断拦截] 目标输出文件无有效视频画面流 ({check_target.resolve()})，绝对禁止删除源文件！", file=sys.stderr)
             return
 
         out_dur = out_info.get("duration", 0.0)
-        out_size = final_output.stat().st_size
+        out_size = check_target.stat().st_size
 
     for s in sources:
         try:
             if not s.exists():
                 continue
             s_res = s.resolve()
-            if final_res is not None and s_res == final_res:
+            if not allow_same_as_output and final_res is not None and s_res == final_res:
                 print(f"  * [源文件清理跳过] 源文件与输出文件路径相同，已保护: {s_res}")
                 continue
 
@@ -2300,7 +2329,8 @@ def process_video(
     drop_ads: bool = False,
     max_ad_duration: float = 120.0,
     current_idx: int = 1,
-    total_files: int = 1
+    total_files: int = 1,
+    keep_name: bool = False
 ) -> bool:
     """处理单个视频文件（支持深度容错修复、智能去黑边、硬件极速压缩与本地 SSD 缓冲写入）。"""
     print("=" * 70)
@@ -2524,7 +2554,7 @@ def process_video(
             target_dir.mkdir(parents=True, exist_ok=True)
             clean_stem = get_clean_stem(file_path)
             action_tag = "compressed" if need_compress else "repaired"
-            output_name = f"{clean_stem}_{action_tag}.mp4"
+            output_name = f"{clean_stem}.mp4" if keep_name else f"{clean_stem}_{action_tag}.mp4"
             final_output_file = target_dir / output_name
         else:
             target_dir = output_dir.parent
@@ -2535,16 +2565,17 @@ def process_video(
         target_dir = file_path.parent
         clean_stem = get_clean_stem(file_path)
         action_tag = "compressed" if need_compress else "repaired"
-        output_name = f"{clean_stem}_{action_tag}.mp4"
+        output_name = f"{clean_stem}.mp4" if keep_name else f"{clean_stem}_{action_tag}.mp4"
         final_output_file = target_dir / output_name
 
-    # 避免输入输出路径完全相同覆盖原文件
-    try:
-        if final_output_file.resolve() == file_path.resolve():
-            output_name = f"{file_path.stem}_crop.mp4" if crop_applied else f"{file_path.stem}_fixed.mp4"
-            final_output_file = target_dir / output_name
-    except Exception:
-        pass
+    # 避免输入输出路径完全相同覆盖原文件 (未指定 keep_name 时)
+    if not keep_name:
+        try:
+            if final_output_file.resolve() == file_path.resolve():
+                output_name = f"{file_path.stem}_crop.mp4" if crop_applied else f"{file_path.stem}_fixed.mp4"
+                final_output_file = target_dir / output_name
+        except Exception:
+            pass
 
     # 使用本地 SSD /tmp 目录作为临时输出缓冲：
     # 彻底杜绝 SMB 局域网网络盘在 -movflags +faststart 时产生的高延迟与 I/O 卡死
@@ -2940,8 +2971,29 @@ def process_video(
 
             size_change = (new_size - orig_size) / orig_size * 100 if orig_size > 0 else 0
 
-            # 将本地 SSD 临时生成的文件安全移动到目标位置（支持跨文件系统/SMB共享盘，规避 macOS fcopyfile ENXIO 缺陷）
-            safe_move_file(temp_output_file, final_output_file)
+            # 原名保持与就地替换逻辑 (keep_name):
+            # 1. 若配合 -d (--delete-source)：直接删除原文件，无需重命名；再将临时生成的文件移入目标位置
+            # 2. 若未指定 -d：先将原文件重命名备份 (如 movie_orig.mp4)；再将临时生成的文件移入目标位置
+            orig_backup_path = None
+            if keep_name:
+                if delete_source:
+                    remove_source_files(
+                        [file_path],
+                        final_output=final_output_file,
+                        reason="原名就地替换成功后安全清理源文件 (--keep-name -d)",
+                        verify_file=temp_output_file,
+                        allow_same_as_output=True
+                    )
+                    safe_move_file(temp_output_file, final_output_file)
+                else:
+                    orig_backup_path = derive_backup_source_path(file_path)
+                    safe_move_file(file_path, orig_backup_path)
+                    print(f"  * [原文件已重命名备份]: {orig_backup_path.name}")
+                    safe_move_file(temp_output_file, final_output_file)
+                    print(f"  * [原名保存] 目标视频已保持原名保存: {final_output_file.name}")
+            else:
+                # 将本地 SSD 临时生成的文件安全移动到目标位置（支持跨文件系统/SMB共享盘，规避 macOS fcopyfile ENXIO 缺陷）
+                safe_move_file(temp_output_file, final_output_file)
 
             action_desc = "修复与压缩" if need_compress else "极速无损换封装"
             size_label = "压缩后大小" if need_compress else "换封装后大小"
@@ -2949,6 +3001,9 @@ def process_video(
             print(f"  * 原始大小: {format_bytes(orig_size)} -> {size_label}: {format_bytes(new_size)} ({size_change:+.1f}%)")
             print(f"  * 输出路径: {final_output_file.resolve()}")
             if vlog:
+                detail_suffix = ""
+                if keep_name:
+                    detail_suffix = " (原名保存模式: 源文件已清理)" if delete_source else f" (原名保存模式: 源文件已备份为 {orig_backup_path.name if orig_backup_path else 'orig'})"
                 vlog.log_processed(
                     input_file=file_path,
                     output_target=final_output_file,
@@ -2958,10 +3013,10 @@ def process_video(
                     new_size=new_size,
                     elapsed_sec=duration_sec,
                     orig_info=info,
-                    details=reason,
+                    details=f"{reason}{detail_suffix}",
                     tool="vfix"
                 )
-            if delete_source:
+            if delete_source and not keep_name:
                 remove_source_files([file_path], final_output_file, reason="转码压缩成功后安全清理源文件 (--delete-source)")
             return True
         else:
@@ -3006,7 +3061,8 @@ def process_merged_videos(
     skip_confirm: bool = False,
     delete_source: bool = False,
     crop: Optional[str] = None,
-    aspect: Optional[str] = None
+    aspect: Optional[str] = None,
+    keep_name: bool = False
 ) -> bool:
     """多分卷视频智能对齐合并与硬件/软件容错编码压缩 (支持极速无损流复制合并与 Filter Concat Pipeline)。"""
     is_merge_only = merge_only or force_repair_only
@@ -3028,7 +3084,7 @@ def process_merged_videos(
         tentative_ext = list(input_exts)[0]
 
     preview_output_file = derive_merged_output_path(
-        file_paths, output_target, is_compressed=not is_merge_only, default_ext=tentative_ext
+        file_paths, output_target, is_compressed=not is_merge_only, default_ext=tentative_ext, keep_name=keep_name
     )
     print(f"  * 拟定输出路径: {preview_output_file.resolve()}")
 
@@ -3053,7 +3109,7 @@ def process_merged_videos(
                     if len(indices) == n_files and sorted(indices) == list(range(1, n_files + 1)):
                         file_paths = [file_paths[i - 1] for i in indices]
                         preview_output_file = derive_merged_output_path(
-                            file_paths, output_target, is_compressed=not is_merge_only, default_ext=tentative_ext
+                            file_paths, output_target, is_compressed=not is_merge_only, default_ext=tentative_ext, keep_name=keep_name
                         )
                         print("\n[已更新拼接顺序]:")
                         for idx, f in enumerate(file_paths, 1):
@@ -3187,7 +3243,7 @@ def process_merged_videos(
         target_ext = ".mp4"
 
     final_output_file = derive_merged_output_path(
-        file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext
+        file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name
     )
     final_output_file.parent.mkdir(parents=True, exist_ok=True)
     temp_output_file = temp_dir / f"vrc_merge_{os.getpid()}_{final_output_file.name}"
@@ -3325,7 +3381,12 @@ def process_merged_videos(
                             details=f"极速无损流复制合并 ({n_files} 个分卷)",
                             tool="vfix"
                         )
-                    if delete_source:
+                    if keep_name and not delete_source:
+                        for fp in file_paths:
+                            orig_bak = derive_backup_source_path(fp)
+                            safe_move_file(fp, orig_bak)
+                            print(f"  * [分卷原文件已重命名备份]: {orig_bak.name}")
+                    elif delete_source:
                         remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                     return True
                 else:
@@ -3439,7 +3500,12 @@ def process_merged_videos(
                         details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷)",
                         tool="vfix"
                     )
-                if delete_source:
+                if keep_name and not delete_source:
+                    for fp in file_paths:
+                        orig_bak = derive_backup_source_path(fp)
+                        safe_move_file(fp, orig_bak)
+                        print(f"  * [分卷原文件已重命名备份]: {orig_bak.name}")
+                elif delete_source:
                     remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                 return True
             else:
@@ -3623,7 +3689,12 @@ def process_merged_videos(
                     details=f"多源滤镜对齐拼接合并 ({n_files} 个分卷)",
                     tool="vfix"
                 )
-            if delete_source:
+            if keep_name and not delete_source:
+                for fp in file_paths:
+                    orig_bak = derive_backup_source_path(fp)
+                    safe_move_file(fp, orig_bak)
+                    print(f"  * [分卷原文件已重命名备份]: {orig_bak.name}")
+            elif delete_source:
                 remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
             return True
         else:
@@ -3814,9 +3885,16 @@ def collect_video_files(input_patterns: List[str], recursive: bool, is_merge: bo
         if is_single_explicit_file:
             return False
         if is_merge:
-            # 合并模式下允许合并已压缩(_compressed)或已修复(_repaired)的分卷，仅自动排除合并结果(_merged)
-            return stem.endswith("_merged")
-        return stem.endswith("_repaired") or stem.endswith("_compressed") or stem.endswith("_merged")
+            # 合并模式下允许合并已压缩(_compressed)或已修复(_repaired)的分卷，仅自动排除合并结果(_merged)与备份原文件(_orig)
+            return stem.endswith("_merged") or stem.endswith("_orig") or stem.endswith("_origin") or "_orig_" in stem
+        return (
+            stem.endswith("_repaired")
+            or stem.endswith("_compressed")
+            or stem.endswith("_merged")
+            or stem.endswith("_orig")
+            or stem.endswith("_origin")
+            or "_orig_" in stem
+        )
 
     for pattern_str in input_patterns:
         p = normalize_and_resolve_path(pattern_str)
@@ -3921,24 +3999,29 @@ def main():
    vfix *.part -d
    vfix broken_video.mp4 -o /mnt/nas/output/
 
-2. 多分卷极速无损合并（强烈推荐，秒级完成、零画质损失）:
+2. 保持原文件名输出 / 就地替换 (原名保存):
+   vfix movie.mp4 -k                            # 目标文件保持原名 movie.mp4，原文件自动备份为 movie_orig.mp4
+   vfix movie.mp4 -k -d                         # 目标文件保持原名 movie.mp4，直接替换并清理源文件 (无需重命名)
+   vfix /mnt/nas/videos/ -r -k -d -B            # 整个目录递归原名就地替换并清理源文件，后台脱机运行
+
+3. 多分卷极速无损合并（强烈推荐，秒级完成、零画质损失）:
    vfix CD1.avi CD2.avi -M
    vfix Movie_Part1.mp4 Movie_Part2.mp4 -M -d   # 合并完成后自动清理分卷
 
-3. 视频智能去黑边 / 竖屏短剧锁定:
+4. 视频智能去黑边 / 竖屏短剧锁定:
    vfix movie.mp4 -c                            # 自动剔除上下/左右黑边与跑马灯水印
    vfix drama.mp4 -a 9:16                       # 锁定标准 9:16 竖屏短剧画幅居中裁剪
 
-4. 批量递归处理整个目录或 NAS 共享盘:
+5. 批量递归处理整个目录或 NAS 共享盘:
    vfix /mnt/nas/videos/ -r -o /mnt/nas/compressed/
 
-5. 老旧播放器兼容模式（强制编码为 H.264）:
+6. 老旧播放器兼容模式（强制编码为 H.264）:
    vfix input.mkv --h264
 
-6. 仅修复容器封装损坏（不改变画质、不耗费重编码时间）:
+7. 仅修复容器封装损坏（不改变画质、不耗费重编码时间）:
    vfix broken_index.mp4 --force-repair-only
 
-7. 后台脱机批量运行与状态管理 (多任务/长耗时必备，关闭终端/断开SSH不中断):
+8. 后台脱机批量运行与状态管理 (多任务/长耗时必备，关闭终端/断开SSH不中断):
    vfix *.part -d -B                            # 后台脱机运行，终端即刻释放
    vfix /mnt/nas/videos/ -r -d -B               # 后台脱机递归处理整个目录并安全清理源文件
    vfix --status                                # 实时查看后台任务运行状态、当前进度与最新日志
@@ -3953,6 +4036,9 @@ def main():
                         help="指定输出目录或输出文件名 (例如: -o /mnt/nas/ 或 -o full_movie.mp4)")
     parser.add_argument("-d", "--delete-source", "--del-src", "--remove-source", dest="delete_source", action="store_true",
                         help="处理或合并完全成功后自动删除源文件 (谨慎使用；若失败或手动中断则严格保护绝不删除)")
+    parser.add_argument("-k", "--keep-name", "--inplace", "--in-place", dest="keep_name", action="store_true",
+                        help="生成的目标文件名保持与原文件名一致（不添加 _compressed / _repaired 后缀）。"
+                             "未指定 -d 时自动将原文件重命名备份 (如 file_orig.mp4)；若配合 -d 使用则直接替换且无需重命名原文件")
     parser.add_argument("-r", "--recursive", action="store_true",
                         help="当输入为目录时，递归扫描并处理其下所有子目录中的视频")
 
@@ -4112,7 +4198,8 @@ def main():
                 drop_ads=args.drop_ads,
                 max_ad_duration=args.max_ad_duration,
                 current_idx=1,
-                total_files=1
+                total_files=1,
+                keep_name=args.keep_name
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4136,7 +4223,8 @@ def main():
                 skip_confirm=args.yes or args.background,
                 delete_source=args.delete_source,
                 crop=crop_setting,
-                aspect=args.aspect
+                aspect=args.aspect,
+                keep_name=args.keep_name
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4175,7 +4263,8 @@ def main():
             drop_ads=args.drop_ads,
             max_ad_duration=args.max_ad_duration,
             current_idx=idx,
-            total_files=len(video_files)
+            total_files=len(video_files),
+            keep_name=args.keep_name
         )
         if ok:
             success_count += 1
