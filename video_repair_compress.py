@@ -3090,6 +3090,7 @@ def process_merged_videos(
     salvaged_audio_files: List[Optional[Path]] = []
     audio_modes: List[str] = []
     has_any_audio = False
+    concat_list_file: Optional[Path] = None
 
     # 预检并抢救所有分卷的音频轨道
     for idx, f in enumerate(file_paths):
