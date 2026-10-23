@@ -118,12 +118,40 @@ def get_processed_log_path() -> Path:
     return get_log_dir() / "processed.log"
 
 
+def get_failed_log_path() -> Path:
+    return get_log_dir() / "failed.log"
+
+
 def get_deleted_log_path() -> Path:
     return get_log_dir() / "deleted.log"
 
 
 def get_main_log_path() -> Path:
     return get_log_dir() / f"{_TOOL_NAME}.log"
+
+
+def log_failed(
+    input_file: Union[str, Path, List[Union[str, Path]]],
+    error_msg: Optional[str] = None,
+    action: str = "PROCESS",
+    orig_size: Optional[Union[int, float]] = None,
+    elapsed_sec: Optional[float] = None,
+    orig_info: Optional[Dict[str, Any]] = None,
+    details: Optional[str] = None,
+    tool: Optional[str] = None
+) -> None:
+    """单独记录失败任务的便捷入口"""
+    log_processed(
+        input_file=input_file,
+        output_target=None,
+        status="FAILED",
+        action=action,
+        orig_size=orig_size,
+        elapsed_sec=elapsed_sec,
+        orig_info=orig_info,
+        details=details or error_msg,
+        tool=tool
+    )
 
 
 def log_processed(
@@ -210,6 +238,8 @@ def log_processed(
             media_specs.append(format_bitrate(float(br)))
     media_str = f" | {', '.join(media_specs)}" if media_specs else ""
 
+    is_fail = status.upper() in ("FAILED", "FAIL", "ERROR")
+
     # 构建结构化日志块
     lines = [
         f"[{now_str}] [{tool_label}] [{status.upper()}] [{action.upper()}] - {input_desc}",
@@ -218,13 +248,18 @@ def log_processed(
         f"  * 体积: {size_str} | 耗时: {cost_str}"
     ]
     if details:
-        lines.append(f"  * 详情: {details.strip()}")
+        field_name = "失败原因" if is_fail else "详情"
+        lines.append(f"  * {field_name}: {details.strip()}")
     lines.append("")  # 空行分隔
 
     log_entry = "\n".join(lines) + "\n"
 
     # 写入 processed.log
     _append_to_file(get_processed_log_path(), log_entry)
+
+    # 若失败则单独写入 failed.log
+    if is_fail:
+        _append_to_file(get_failed_log_path(), log_entry)
 
     # 同步写入综合日志 vfix.log
     main_line = f"{now_str} [{status.upper()}] [{tool_label}:{action.upper()}] {input_desc} -> {out_desc} ({size_str}, 耗时 {cost_str})"

@@ -131,11 +131,37 @@ class _EmbeddedVideoLogger:
     def get_processed_log_path(self) -> Path:
         return self.get_log_dir() / "processed.log"
 
+    def get_failed_log_path(self) -> Path:
+        return self.get_log_dir() / "failed.log"
+
     def get_deleted_log_path(self) -> Path:
         return self.get_log_dir() / "deleted.log"
 
     def get_main_log_path(self) -> Path:
         return self.get_log_dir() / f"{self._tool_name}.log"
+
+    def log_failed(
+        self,
+        input_file: Union[str, Path, List[Union[str, Path]]],
+        error_msg: Optional[str] = None,
+        action: str = "AUTOCROP",
+        orig_size: Optional[Union[int, float]] = None,
+        elapsed_sec: Optional[float] = None,
+        orig_info: Optional[Dict[str, Any]] = None,
+        details: Optional[str] = None,
+        tool: Optional[str] = None
+    ) -> None:
+        self.log_processed(
+            input_file=input_file,
+            output_target=None,
+            status="FAILED",
+            action=action,
+            orig_size=orig_size,
+            elapsed_sec=elapsed_sec,
+            orig_info=orig_info,
+            details=details or error_msg,
+            tool=tool
+        )
 
     def log_processed(
         self,
@@ -155,6 +181,7 @@ class _EmbeddedVideoLogger:
             return
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         tool_label = tool or self._tool_name
+        is_fail = status.upper() in ("FAILED", "FAIL", "ERROR")
         if isinstance(input_file, (list, tuple)):
             input_count = len(input_file)
             first_path = str(Path(input_file[0]).resolve())
@@ -195,9 +222,13 @@ class _EmbeddedVideoLogger:
             f"  * 体积: {size_str} | 耗时: {cost_str}"
         ]
         if details:
-            lines.append(f"  * 详情: {details.strip()}")
+            field_name = "失败原因" if is_fail else "详情"
+            lines.append(f"  * {field_name}: {details.strip()}")
         lines.append("")
-        self._append(self.get_processed_log_path(), "\n".join(lines) + "\n")
+        entry_text = "\n".join(lines) + "\n"
+        self._append(self.get_processed_log_path(), entry_text)
+        if is_fail:
+            self._append(self.get_failed_log_path(), entry_text)
         main_line = f"{now_str} [{status.upper()}] [{tool_label}:{action.upper()}] {input_desc} -> {out_desc} ({size_str}, 耗时 {cost_str})"
         if details:
             main_line += f" | {details.strip()}"
@@ -3148,7 +3179,7 @@ def main():
 
     print(f"找到 {len(video_files)} 个待处理视频文件。")
     if not args.no_log:
-        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vcrop.log) [自动记录]")
+        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / failed.log / deleted.log / vcrop.log) [自动记录]")
     if not args.detect_only and not args.preview:
         engine_desc = {
             "hevc_videotoolbox": "Apple VideoToolbox HEVC/H.265 GPU 硬件加速 (极速、体积小、画质高)",
@@ -3214,8 +3245,10 @@ def main():
 
     print(f"\n{'='*75}")
     print(f"[处理总结] 全部文件处理完成: 成功 {success_count} 个, 失败/异常 {fail_count} 个。")
+    if fail_count > 0 and not args.no_log:
+        print(f"  * 失败任务明细见: {vlog.get_failed_log_path()} [独立记录]")
     if not args.no_log:
-        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / deleted.log / vcrop.log)")
+        print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / failed.log / deleted.log / vcrop.log)")
     sys.exit(0 if fail_count == 0 else 1)
 
 
