@@ -893,8 +893,64 @@ def get_clean_stem(file_path: Path) -> str:
     return stem
 
 
+def safe_truncate_name(text: str, max_bytes: int = 200) -> str:
+    """确保 text 在 UTF-8 编码下的字节数不超过 max_bytes。
+    若超长，则安全从尾部删除多余字符，绝不产生非法的多字节截断乱码。
+    自动去除末尾截断遗留的空格、点、下划线、减号等杂乱符号。
+    """
+    if not text:
+        return ""
+    encoded = text.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return text
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    cleaned = re.sub(r'[\s_\-\.\(\[（【]+$', '', truncated)
+    return cleaned if cleaned else truncated
+
+
+def make_safe_filename(stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> str:
+    """组合 stem 和 suffix 生成一个在底层文件系统 (NAME_MAX 255 字节限制) 绝不超长的合法文件名。
+    默认预留冗余空间，将总文件名控制在 max_total_bytes (默认 240 字节) 以内。
+    """
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    return f"{safe_stem}{suffix}"
+
+
+def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
+    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes。"""
+    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    return temp_dir / f"{prefix}{safe_stem}{suffix}"
+
+
+def safe_path_exists(p: Optional[Path]) -> bool:
+    """安全判定文件是否存在，吸收并防御任何底层文件名过长 (ENAMETOOLONG / Errno 36) 或权限异常。"""
+    if p is None:
+        return False
+    try:
+        return p.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def safe_path_unlink(p: Optional[Path]) -> None:
+    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常。"""
+    if p is None:
+        return
+    try:
+        p.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
 def derive_backup_source_path(file_path: Path) -> Path:
-    """生成原文件的安全备份重命名路径 (如 movie.mp4 -> movie_orig.mp4)。若重名则自动递增序号。"""
+    """生成原文件的安全备份重命名路径 (如 movie.mp4 -> movie_orig.mp4)。若重名则自动递增序号。
+    全面防护底层文件名过长 (NAME_MAX 255 字节限制)，必要时自动安全截短 stem。
+    """
     parent = file_path.parent
     name = file_path.name
     clean_stem = get_clean_stem(file_path)
@@ -902,14 +958,18 @@ def derive_backup_source_path(file_path: Path) -> Path:
     if not remainder.startswith((".", "_", "-")):
         remainder = f"_{remainder}" if remainder else ".mp4"
 
-    candidate = parent / f"{clean_stem}_orig{remainder}"
-    if not candidate.exists():
+    # 为 _orig_999 以及 remainder 预留空间，确保总文件名不超过 240 字节
+    max_stem_bytes = 240 - len(f"_orig_999{remainder}".encode("utf-8", errors="ignore"))
+    safe_stem = safe_truncate_name(clean_stem, max_bytes=max(10, max_stem_bytes))
+
+    candidate = parent / f"{safe_stem}_orig{remainder}"
+    if not safe_path_exists(candidate):
         return candidate
 
     idx = 1
     while True:
-        candidate = parent / f"{clean_stem}_orig_{idx}{remainder}"
-        if not candidate.exists():
+        candidate = parent / f"{safe_stem}_orig_{idx}{remainder}"
+        if not safe_path_exists(candidate):
             return candidate
         idx += 1
 
@@ -1043,16 +1103,16 @@ def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
     本函数自动尝试 NFC/NFD 标准化及逐级目录项匹配，精准定位真实存在的路径。
     """
     p = Path(path_input).expanduser()
-    if p.exists():
+    if safe_path_exists(p):
         return p
 
     p_str = str(p)
     # 优先尝试整段路径的 NFD 和 NFC 转换
     nfd_p = Path(unicodedata.normalize("NFD", p_str))
-    if nfd_p.exists():
+    if safe_path_exists(nfd_p):
         return nfd_p
     nfc_p = Path(unicodedata.normalize("NFC", p_str))
-    if nfc_p.exists():
+    if safe_path_exists(nfc_p):
         return nfc_p
 
     # 逐级目录项解析（针对挂载点路径中部分层级为 NFD，部分为 NFC 的混合情况）
@@ -1066,17 +1126,17 @@ def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
 
     for part in parts[start_idx:]:
         target = curr / part
-        if target.exists():
+        if safe_path_exists(target):
             curr = target
             continue
 
         target_nfd = curr / unicodedata.normalize("NFD", part)
-        if target_nfd.exists():
+        if safe_path_exists(target_nfd):
             curr = target_nfd
             continue
 
         target_nfc = curr / unicodedata.normalize("NFC", part)
-        if target_nfc.exists():
+        if safe_path_exists(target_nfc):
             curr = target_nfc
             continue
 
@@ -1129,15 +1189,14 @@ def derive_merged_output_path(
     else:
         derived = common
 
-    if keep_name:
-        default_filename = f"{derived}{default_ext}"
-    else:
-        tag = "_compressed" if is_compressed else ""
-        default_filename = f"{derived}_merged{tag}{default_ext}"
+    tag = "_compressed" if is_compressed else ""
+    suffix = default_ext if keep_name else f"_merged{tag}{default_ext}"
+    default_filename = make_safe_filename(derived, suffix=suffix, max_total_bytes=240)
 
     if output_target is not None:
         if output_target.suffix.lower() in BASE_VIDEO_EXTENSIONS:
-            return output_target
+            safe_out_name = make_safe_filename(output_target.stem, suffix=output_target.suffix, max_total_bytes=240)
+            return output_target.parent / safe_out_name
         return output_target / default_filename
 
     return file_paths[0].parent / default_filename
@@ -1551,15 +1610,8 @@ def detect_h264_sps_pps_for_idr(idr_data: bytes, sei_data: Optional[bytes] = Non
     return None, None, None
 
 
-def salvage_corrupted_mp4(file_path: Path, output_file: Path) -> bool:
-    """针对头部/索引损毁（如 moov 丢失、含全零空洞的 .part、下载未完成文件）的 MP4/MOV 实施深度底层裸流抢救：
-    1. 扫描文件寻找残存的 stco / stsz / stsc 及 audio trak 索引；
-    2. 提取并验证首个 IDR 关键帧，毫秒级逆向推导出精准分辨率与 SPS/PPS 参数；
-    3. 采用单遍流式线性扫描 (8MB 缓存)，将 H.264 视频帧与 AAC 音频包极速分离并注入标准头；
-    4. 交由 FFmpeg 原生 -c copy 无损封装为标准带有 faststart 索引头的完好 MP4；
-    5. 成功返回 True，失败返回 False。
-    """
-    t0 = time.time()
+def _salvage_corrupted_mp4_stco(file_path: Path, output_file: Path) -> bool:
+    """针对尾部残留有效 stco / trak 的损毁 MP4 实施原生流式扫描抢救"""
     file_size = file_path.stat().st_size
     if file_size < 1024:
         return False
@@ -1765,6 +1817,113 @@ def salvage_corrupted_mp4(file_path: Path, output_file: Path) -> bool:
                         p.unlink(missing_ok=True)
                     except Exception:
                         pass
+
+
+def salvage_with_untrunc(file_path: Path, output_file: Path) -> bool:
+    """当 MP4 文件未完整闭合（即无 stco / 无 moov，如录制异常断电、下载中断截断）时，
+    自动寻找同目录或同批次中已正常生成或健康的参考视频，调用 untrunc 重建 moov 与采样表。
+    """
+    untrunc_bin = shutil.which("untrunc")
+    if not untrunc_bin and Path("/usr/local/bin/untrunc").exists():
+        untrunc_bin = "/usr/local/bin/untrunc"
+    if not untrunc_bin:
+        return False
+
+    candidates = []
+    # 搜索同一目录下的候选参考视频
+    for pattern in ("*.mp4", "*.mov", "*.m4v"):
+        for f in file_path.parent.glob(pattern):
+            if f.resolve() == file_path.resolve() or f.resolve() == output_file.resolve():
+                continue
+            try:
+                if f.stat().st_size > 10 * 1024 * 1024:
+                    candidates.append(f)
+            except Exception:
+                pass
+
+    if not candidates:
+        return False
+
+    # 排序候选视频：最优先匹配公共前缀最长者，其次优先 _repaired / _compressed
+    def candidate_score(p: Path):
+        p_name = p.name
+        f_name = file_path.name
+        common_len = 0
+        for c1, c2 in zip(p_name, f_name):
+            if c1 == c2:
+                common_len += 1
+            else:
+                break
+        score = common_len * 2
+        if "_repaired" in p_name:
+            score += 15
+        elif "_compressed" in p_name:
+            score += 10
+        return -score
+
+    candidates.sort(key=candidate_score)
+    temp_dir = Path(tempfile.gettempdir())
+
+    best_candidate_file = None
+    best_err_len = 999999999
+
+    for ref in candidates[:8]:
+        temp_fixed = temp_dir / f"untrunc_salvage_{os.getpid()}_{ref.stem[:12]}.mp4"
+        cmd = [str(untrunc_bin), "-dst", str(temp_fixed), str(ref), str(file_path)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=180)
+            if temp_fixed.exists() and temp_fixed.stat().st_size > 1024:
+                # 校验视频是否能被完美解码（验证宏块与 SPS/PPS 分辨率是否精准对齐）
+                chk = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-ss", "30", "-i", str(temp_fixed), "-vframes", "5", "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=20
+                )
+                err_len = len(chk.stderr.strip())
+                if chk.returncode == 0 and err_len == 0:
+                    if best_candidate_file and best_candidate_file.exists():
+                        best_candidate_file.unlink(missing_ok=True)
+                    shutil.move(str(temp_fixed), str(output_file))
+                    print(f"  * [残缺救砖] 成功利用完美同构参考视频 ({ref.name}) 通过 untrunc 成功重建完整 moov 索引与音视频轨！")
+                    return True
+                elif chk.returncode == 0 and err_len < best_err_len:
+                    if best_candidate_file and best_candidate_file.exists():
+                        best_candidate_file.unlink(missing_ok=True)
+                    best_candidate_file = temp_fixed
+                    best_err_len = err_len
+                    continue
+        except Exception:
+            pass
+
+        if temp_fixed.exists() and temp_fixed != best_candidate_file:
+            try:
+                temp_fixed.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if best_candidate_file and best_candidate_file.exists():
+        shutil.move(str(best_candidate_file), str(output_file))
+        print(f"  * [残缺救砖] 采用次优同构参考视频重建 moov 索引 (残存微小解码偏差)！")
+        return True
+
+    return False
+
+
+def salvage_corrupted_mp4(file_path: Path, output_file: Path) -> bool:
+    """针对头部/索引损毁（如 moov 丢失、含全零空洞的 .part、下载未完成文件）的 MP4/MOV 实施深度底层裸流抢救：
+    1. 首先尝试原生流式扫描分析寻找尾部残存 stco / trak 索引提取 Annex-B / ADTS 并无损封装；
+    2. 若文件无残存 stco 索引（截断录制未完成文件），自动联动 untrunc 引擎与同批次参考视频进行原子索引深度重构。
+    """
+    file_size = file_path.stat().st_size
+    if file_size < 1024:
+        return False
+
+    try:
+        if _salvage_corrupted_mp4_stco(file_path, output_file):
+            return True
+    except Exception:
+        pass
+
+    return salvage_with_untrunc(file_path, output_file)
 
 
 def preflight_audio(file_path: Path, info_or_has_audio: Any = True) -> str:
@@ -2381,7 +2540,7 @@ def process_video(
         print(f"  * [残缺救砖] 检测到容器头或索引严重损毁（常规解复用失败），启动 MP4/MOV 底层原子流提取抢救引擎...")
         temp_dir = Path(tempfile.gettempdir())
         clean_stem = get_clean_stem(file_path)
-        salvaged_candidate = temp_dir / f"vfix_salvaged_{os.getpid()}_{clean_stem}.mp4"
+        salvaged_candidate = make_safe_temp_path(temp_dir, f"vfix_salvaged_{os.getpid()}_", clean_stem, suffix=".mp4", max_total_bytes=240)
         if salvage_corrupted_mp4(file_path, salvaged_candidate):
             salvaged_src_file = salvaged_candidate
             info = probe_video(salvaged_src_file)
@@ -2578,40 +2737,53 @@ def process_video(
     if not need_compress and not force_repair_only:
         print(f"  * 提示: 该文件已处于工业级高兼容或高能效状态，若执意强制重新编码压制可添加参数: --force-compress")
 
+    clean_stem = get_clean_stem(file_path)
+    action_tag = "compressed" if need_compress else "repaired"
+    suffix = ".mp4" if keep_name else f"_{action_tag}.mp4"
+
     if output_dir:
         # 兼容用户传递的是目录，还是直接指定了输出目标文件名
         if output_dir.is_dir() or str(output_dir).endswith(("/", "\\")) or not output_dir.suffix:
             target_dir = output_dir
             target_dir.mkdir(parents=True, exist_ok=True)
-            clean_stem = get_clean_stem(file_path)
-            action_tag = "compressed" if need_compress else "repaired"
-            output_name = f"{clean_stem}.mp4" if keep_name else f"{clean_stem}_{action_tag}.mp4"
+            output_name = make_safe_filename(clean_stem, suffix=suffix, max_total_bytes=240)
             final_output_file = target_dir / output_name
         else:
             target_dir = output_dir.parent
             target_dir.mkdir(parents=True, exist_ok=True)
-            final_output_file = output_dir
+            safe_out_name = make_safe_filename(output_dir.stem, suffix=output_dir.suffix, max_total_bytes=240)
+            final_output_file = target_dir / safe_out_name
             output_name = final_output_file.name
     else:
         target_dir = file_path.parent
-        clean_stem = get_clean_stem(file_path)
-        action_tag = "compressed" if need_compress else "repaired"
-        output_name = f"{clean_stem}.mp4" if keep_name else f"{clean_stem}_{action_tag}.mp4"
+        output_name = make_safe_filename(clean_stem, suffix=suffix, max_total_bytes=240)
         final_output_file = target_dir / output_name
 
     # 避免输入输出路径完全相同覆盖原文件 (未指定 keep_name 时)
     if not keep_name:
         try:
             if final_output_file.resolve() == file_path.resolve():
-                output_name = f"{file_path.stem}_crop.mp4" if crop_applied else f"{file_path.stem}_fixed.mp4"
+                extra_tag = "_crop.mp4" if crop_applied else "_fixed.mp4"
+                output_name = make_safe_filename(clean_stem, suffix=extra_tag, max_total_bytes=240)
                 final_output_file = target_dir / output_name
         except Exception:
             pass
 
+    orig_name_bytes = len(file_path.name.encode('utf-8', errors='ignore'))
+    if orig_name_bytes > 220:
+        print(f"  * [文件名保护] 检测到文件名较长 ({orig_name_bytes} 字节)，已自动安全优化控制输出文件名以兼容 Linux/SMB 文件系统 (NAME_MAX 255 字节)")
+
     # 使用本地 SSD /tmp 目录作为临时输出缓冲：
     # 彻底杜绝 SMB 局域网网络盘在 -movflags +faststart 时产生的高延迟与 I/O 卡死
+    # 严格采用 make_safe_temp_path 保证临时文件名绝不超过 Linux/SMB 255 字节限制
     temp_dir = Path(tempfile.gettempdir())
-    temp_output_file = temp_dir / f"vrc_{os.getpid()}_{output_name}"
+    temp_output_file = make_safe_temp_path(
+        temp_dir=temp_dir,
+        prefix=f"vrc_{os.getpid()}_",
+        stem=clean_stem,
+        suffix=f"_{action_tag}.mp4",
+        max_total_bytes=240
+    )
 
     # 深度容错基础参数：
     # -max_error_rate 1.0: 允许坏帧率高达 100%，绝不因 NAL 单元破损强行中断
@@ -2667,7 +2839,7 @@ def process_video(
 
         map_args = []
         if audio_mode == "vorbis_acm":
-            salvaged_audio_file = temp_dir / f"vrc_salvaged_{os.getpid()}_{clean_stem}.aac"
+            salvaged_audio_file = make_safe_temp_path(temp_dir, f"vrc_salvaged_{os.getpid()}_", clean_stem, suffix=".aac", max_total_bytes=240)
             print(f"  * 发现经典 Vorbis ACM 特殊音频封装 (0x6771)，启动独家 Ogg 流清洗抢救并转码为 AAC...")
             t_salvage = time.time()
             if extract_vorbis_acm_audio(file_path, salvaged_audio_file, target_audio_kbps):
@@ -2846,7 +3018,7 @@ def process_video(
         # === 核心安全防线：全方位产物完整性与时长截断核验 ===
         is_truncated = False
         out_probe = None
-        if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
             out_probe = probe_video(temp_output_file)
             if not out_probe or not out_probe.get("width"):
                 success = False
@@ -2873,8 +3045,7 @@ def process_video(
             else:
                 print("  [提示] 硬件加速不支持该特殊规格或遇到破损异常，自动平滑切换至 CPU 软件容错编码优化...")
 
-            if temp_output_file.exists():
-                temp_output_file.unlink(missing_ok=True)
+            safe_path_unlink(temp_output_file)
 
             fallback_video_args = build_video_encode_args(
                 encoder="libx264",
@@ -2900,7 +3071,7 @@ def process_video(
                 total_files=total_files
             )
             is_truncated = False
-            if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+            if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                 out_probe = probe_video(temp_output_file)
                 if not out_probe or not out_probe.get("width"):
                     success = False
@@ -2924,7 +3095,7 @@ def process_video(
             print("  * [残缺救砖] 捕获到解复用器致命错误，自动启动 MP4/MOV 底层原子流提取抢救引擎...")
             temp_dir = Path(tempfile.gettempdir())
             clean_stem = get_clean_stem(file_path)
-            salvaged_candidate = temp_dir / f"vfix_salvaged_{os.getpid()}_{clean_stem}.mp4"
+            salvaged_candidate = make_safe_temp_path(temp_dir, f"vfix_salvaged_{os.getpid()}_", clean_stem, suffix=".mp4", max_total_bytes=240)
             if salvage_corrupted_mp4(file_path, salvaged_candidate):
                 salvaged_src_file = salvaged_candidate
                 if not need_compress:
@@ -2950,7 +3121,7 @@ def process_video(
                         total_files=total_files
                     )
 
-        if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
             new_size = temp_output_file.stat().st_size
 
             # 兜底防膨胀：若压缩后的体积居然大于原文件
@@ -2969,7 +3140,7 @@ def process_video(
                         current_idx=current_idx,
                         total_files=total_files
                     )
-                    if success_p and temp_output_file.exists():
+                    if success_p and safe_path_exists(temp_output_file):
                         new_size = temp_output_file.stat().st_size
                 else:
                     print(f"  [体积保护] 压缩体积仍偏大 ({format_bytes(new_size)} > {format_bytes(orig_size)})，执行深层紧凑压制...")
@@ -2997,7 +3168,7 @@ def process_video(
                         current_idx=current_idx,
                         total_files=total_files
                     )
-                    if success_c and temp_output_file.exists():
+                    if success_c and safe_path_exists(temp_output_file):
                         new_size = temp_output_file.stat().st_size
 
             size_change = (new_size - orig_size) / orig_size * 100 if orig_size > 0 else 0
@@ -3055,8 +3226,7 @@ def process_video(
             if last_err_msg:
                 snippet = "\n".join(last_err_msg.splitlines()[-4:])
                 print(f"  [底层错误] {snippet}", file=sys.stderr)
-            if temp_output_file.exists():
-                temp_output_file.unlink(missing_ok=True)
+            safe_path_unlink(temp_output_file)
             if vlog:
                 vlog.log_processed(
                     input_file=file_path,
@@ -3071,12 +3241,9 @@ def process_video(
                 )
             return False
     finally:
-        if temp_output_file.exists():
-            temp_output_file.unlink(missing_ok=True)
-        if salvaged_audio_file and salvaged_audio_file.exists():
-            salvaged_audio_file.unlink(missing_ok=True)
-        if salvaged_src_file and salvaged_src_file.exists():
-            salvaged_src_file.unlink(missing_ok=True)
+        safe_path_unlink(temp_output_file)
+        safe_path_unlink(salvaged_audio_file)
+        safe_path_unlink(salvaged_src_file)
 
 
 
@@ -3186,7 +3353,9 @@ def process_merged_videos(
         salvaged_file = None
         if mode == "vorbis_acm":
             clean_stem = get_clean_stem(f)
-            temp_salvage = temp_dir / f"vrc_merge_salvage_{os.getpid()}_{idx}_{clean_stem}.aac"
+            temp_salvage = make_safe_temp_path(
+                temp_dir, f"vrc_merge_salvage_{os.getpid()}_{idx}_", clean_stem, suffix=".aac", max_total_bytes=240
+            )
             print(f"  * 分卷 [{idx+1}/{n_files}] 检测到 AVI 特殊音频封装 (Vorbis ACM / 0x6771)，正在清洗提取并转码为 AAC...")
             t_s = time.time()
             if extract_vorbis_acm_audio(f, temp_salvage, 128):
@@ -3277,7 +3446,9 @@ def process_merged_videos(
         file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name
     )
     final_output_file.parent.mkdir(parents=True, exist_ok=True)
-    temp_output_file = temp_dir / f"vrc_merge_{os.getpid()}_{final_output_file.name}"
+    temp_output_file = make_safe_temp_path(
+        temp_dir, f"vrc_merge_{os.getpid()}_", get_clean_stem(final_output_file), suffix=final_output_file.suffix, max_total_bytes=240
+    )
 
     if audio_bitrates:
         avg_a_bps = sum(audio_bitrates) / len(audio_bitrates)
@@ -3388,7 +3559,7 @@ def process_merged_videos(
                 t_start = time.time()
                 success_fast, fast_err = execute_ffmpeg(cmd_fast)
 
-                if success_fast and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+                if success_fast and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                     duration_sec = time.time() - t_start
                     new_size = temp_output_file.stat().st_size
                     size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
@@ -3421,8 +3592,7 @@ def process_merged_videos(
                         remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                     return True
                 else:
-                    if temp_output_file.exists():
-                        temp_output_file.unlink(missing_ok=True)
+                    safe_path_unlink(temp_output_file)
                     reason_snippet = fast_err.strip().splitlines()[-1] if fast_err.strip() else "时间戳/封装限制"
                     print(f"  [提示] 无损流复制拼接未通过 ({reason_snippet})，自动平滑切换至 Concat Demuxer 高保真转码拼接...")
 
@@ -3507,7 +3677,7 @@ def process_merged_videos(
                 )
                 success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode_sw)
 
-            if success_tc and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+            if success_tc and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                 duration_sec = time.time() - t_start
                 new_size = temp_output_file.stat().st_size
                 size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
@@ -3540,13 +3710,11 @@ def process_merged_videos(
                     remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
                 return True
             else:
-                if temp_output_file.exists():
-                    temp_output_file.unlink(missing_ok=True)
+                safe_path_unlink(temp_output_file)
                 reason_snippet = tc_err.strip().splitlines()[-1] if tc_err.strip() else "未知原因"
                 print(f"  [提示] Concat Demuxer 流式转码未通过 ({reason_snippet})，自动平滑切换至多源滤镜拼接...")
         finally:
-            if concat_list_file.exists():
-                concat_list_file.unlink(missing_ok=True)
+            safe_path_unlink(concat_list_file)
     else:
         if not same_res:
             print(f"  [提示] 各分卷视频分辨率不一致 ({', '.join(f'{w}x{h}' for w, h in resolutions)})，自动通过多源智能滤镜对齐拼接...")
@@ -3697,7 +3865,7 @@ def process_merged_videos(
 
         duration_sec = time.time() - t_start
 
-        if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
             new_size = temp_output_file.stat().st_size
             size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
 
@@ -3746,17 +3914,14 @@ def process_merged_videos(
                     details=f"合并失败 ({n_files} 个分卷): {last_err_msg or '未知错误'}",
                     tool="vfix"
                 )
-            if temp_output_file.exists():
-                temp_output_file.unlink(missing_ok=True)
+            safe_path_unlink(temp_output_file)
             return False
     finally:
-        if temp_output_file.exists():
-            temp_output_file.unlink(missing_ok=True)
-        if concat_list_file and concat_list_file.exists():
-            concat_list_file.unlink(missing_ok=True)
-        for sf in salvaged_audio_files:
-            if sf and sf.exists():
-                sf.unlink(missing_ok=True)
+        safe_path_unlink(temp_output_file)
+        safe_path_unlink(concat_list_file)
+        if salvaged_audio_files:
+            for sf in salvaged_audio_files:
+                safe_path_unlink(sf)
 
 
 def normalize_cli_args(raw_args: List[str]) -> List[str]:

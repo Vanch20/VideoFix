@@ -768,6 +768,55 @@ def format_bitrate(bps: float) -> str:
     return f"{bps / 1_000_000:.2f} Mbps"
 
 
+def safe_truncate_name(text: str, max_bytes: int = 200) -> str:
+    """确保 text 在 UTF-8 编码下的字节数不超过 max_bytes。"""
+    if not text:
+        return ""
+    encoded = text.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return text
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    cleaned = re.sub(r'[\s_\-\.\(\[（【]+$', '', truncated)
+    return cleaned if cleaned else truncated
+
+
+def make_safe_filename(stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> str:
+    """组合 stem 和 suffix 生成一个在底层文件系统 (NAME_MAX 255 字节限制) 绝不超长的合法文件名。"""
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    return f"{safe_stem}{suffix}"
+
+
+def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
+    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes。"""
+    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    return temp_dir / f"{prefix}{safe_stem}{suffix}"
+
+
+def safe_path_exists(p: Optional[Path]) -> bool:
+    """安全判定文件是否存在，防御任何底层文件名过长 (ENAMETOOLONG / Errno 36) 或权限异常。"""
+    if p is None:
+        return False
+    try:
+        return p.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def safe_path_unlink(p: Optional[Path]) -> None:
+    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常。"""
+    if p is None:
+        return
+    try:
+        p.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
 def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
     """安全跨文件系统移动文件，彻底规避 macOS 上跨盘/SMB 网络共享时 Python 3.14 fcopyfile 的 ENXIO (Errno 6) 与 Bad file descriptor (Errno 9) 缺陷。"""
     if not src.exists():
@@ -2461,19 +2510,28 @@ def process_single_video(
     if output_target:
         if output_target.is_dir() or str(output_target).endswith(("/", "\\")):
             output_dir = output_target
-            output_file = output_dir / f"{file_path.stem}_crop.mp4"
+            safe_out_name = make_safe_filename(file_path.stem, suffix="_crop.mp4", max_total_bytes=240)
+            output_file = output_dir / safe_out_name
         else:
             output_dir = output_target.parent
-            output_file = output_target
+            safe_out_name = make_safe_filename(output_target.stem, suffix=output_target.suffix, max_total_bytes=240)
+            output_file = output_dir / safe_out_name
     else:
         output_dir = file_path.parent
-        output_file = output_dir / f"{file_path.stem}_crop.mp4"
+        safe_out_name = make_safe_filename(file_path.stem, suffix="_crop.mp4", max_total_bytes=240)
+        output_file = output_dir / safe_out_name
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 本地 SSD 临时暂存路径
     temp_dir = Path(tempfile.gettempdir())
-    temp_output_file = temp_dir / f"vcrop_{os.getpid()}_{output_file.name}"
+    temp_output_file = make_safe_temp_path(
+        temp_dir=temp_dir,
+        prefix=f"vcrop_{os.getpid()}_",
+        stem=file_path.stem,
+        suffix="_crop.mp4",
+        max_total_bytes=240
+    )
 
     # 6. 音频流策略
     audio_mode = preflight_audio_mode(file_path, has_audio)
@@ -2640,7 +2698,7 @@ def process_single_video(
     # === 核心安全防线：全方位产物完整性与时长截断核验 ===
     is_truncated = False
     out_probe = None
-    if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+    if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
         out_probe = probe_video(temp_output_file)
         if not out_probe or not out_probe.get("width"):
             success = False
@@ -2662,8 +2720,7 @@ def process_single_video(
         else:
             print("\n  [提示] 硬件加速转码未通过，自动平滑切换至 CPU 软件编码优化...")
 
-        if temp_output_file.exists():
-            temp_output_file.unlink(missing_ok=True)
+        safe_path_unlink(temp_output_file)
 
         cpu_maxrate = f"{int(target_bps * 1.5 / 1000)}k"
         cpu_bufsize = f"{int(target_bps * 3.0 / 1000)}k"
@@ -2701,7 +2758,7 @@ def process_single_video(
             total_files=total_files
         )
         is_truncated = False
-        if success and temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
             out_probe = probe_video(temp_output_file)
             if not out_probe or not out_probe.get("width"):
                 success = False
@@ -2718,11 +2775,10 @@ def process_single_video(
     if is_truncated:
         success = False
 
-    if not success or not temp_output_file.exists() or temp_output_file.stat().st_size == 0:
+    if not success or not safe_path_exists(temp_output_file) or temp_output_file.stat().st_size == 0:
         err_snippet = err_msg if not success else "生成的临时输出文件为空"
         print(f"\n  [错误] 裁剪转码失败: {err_snippet}", file=sys.stderr)
-        if temp_output_file.exists():
-            temp_output_file.unlink(missing_ok=True)
+        safe_path_unlink(temp_output_file)
         if vlog:
             vlog.log_processed(
                 input_file=file_path,
@@ -2775,16 +2831,16 @@ def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
     本函数自动尝试 NFC/NFD 标准化及逐级目录项匹配，精准定位真实存在的路径。
     """
     p = Path(path_input).expanduser()
-    if p.exists():
+    if safe_path_exists(p):
         return p
 
     p_str = str(p)
     # 优先尝试整段路径的 NFD 和 NFC 转换
     nfd_p = Path(unicodedata.normalize("NFD", p_str))
-    if nfd_p.exists():
+    if safe_path_exists(nfd_p):
         return nfd_p
     nfc_p = Path(unicodedata.normalize("NFC", p_str))
-    if nfc_p.exists():
+    if safe_path_exists(nfc_p):
         return nfc_p
 
     # 逐级目录项解析（针对挂载点路径中部分层级为 NFD，部分为 NFC 的混合情况）
@@ -2798,17 +2854,17 @@ def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
 
     for part in parts[start_idx:]:
         target = curr / part
-        if target.exists():
+        if safe_path_exists(target):
             curr = target
             continue
 
         target_nfd = curr / unicodedata.normalize("NFD", part)
-        if target_nfd.exists():
+        if safe_path_exists(target_nfd):
             curr = target_nfd
             continue
 
         target_nfc = curr / unicodedata.normalize("NFC", part)
-        if target_nfc.exists():
+        if safe_path_exists(target_nfc):
             curr = target_nfc
             continue
 
