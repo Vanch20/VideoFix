@@ -221,7 +221,12 @@ class _EmbeddedVideoLogger:
                 saved_bytes = orig_size - new_size
                 saved_str = f", 节省 {self.format_bytes(saved_bytes)}" if saved_bytes > 0 else (f", 增加 {self.format_bytes(-saved_bytes)}" if saved_bytes < 0 else "")
                 size_str = f"{self.format_bytes(orig_size)} -> {self.format_bytes(new_size)} ({change_pct:+.1f}%{saved_str})"
-        cost_str = f"{elapsed_sec:.1f}s" if elapsed_sec is not None else "未知"
+        if isinstance(elapsed_sec, (int, float)):
+            cost_str = f"{elapsed_sec:.1f}s"
+        elif elapsed_sec is not None:
+            cost_str = str(elapsed_sec)
+        else:
+            cost_str = "未知"
         media_specs = []
         if orig_info:
             w = orig_info.get("width")
@@ -886,11 +891,84 @@ def get_clean_stem(file_path: Path) -> str:
 
     p = Path(name)
     stem = p.stem if p.suffix.lower() in BASE_VIDEO_EXTENSIONS else p.name
-    for action_suffix in ("_compressed", "_repaired", "_merged", "_orig", "_origin"):
+    for action_suffix in ("_cut_compressed", "_cut", "_compressed", "_repaired", "_merged", "_orig", "_origin"):
         if stem.lower().endswith(action_suffix):
             stem = stem[:-len(action_suffix)]
             break
     return stem
+
+
+def format_time_str(seconds: Optional[float]) -> str:
+    """将秒数格式化为易读的时间戳 (如 01:30:00 或 05:30)。"""
+    if seconds is None or seconds < 0:
+        return "00:00"
+    total_sec = int(seconds)
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    sec = total_sec % 60
+    millis = int(round((seconds - total_sec) * 100))
+    if millis > 0:
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{sec:02d}.{millis:02d}"
+        return f"{minutes:02d}:{sec:02d}.{millis:02d}"
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def parse_time_offset(val: Optional[Union[str, float, int]]) -> Optional[float]:
+    """解析多样化的人类可读时间字符串为绝对秒数 (支持 30m, 5s, 00:30:00, 1h20m, 1800, 以及负数如 -5m)。"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+
+    is_negative = False
+    if s.startswith("-"):
+        is_negative = True
+        s = s[1:].strip()
+    elif s.startswith("+"):
+        s = s[1:].strip()
+
+    # 1. 冒号时间戳格式 (HH:MM:SS 或 MM:SS)
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            if len(parts) == 3:
+                h, m, sec = parts
+                total = float(h) * 3600 + float(m) * 60 + float(sec)
+                return -total if is_negative else total
+            elif len(parts) == 2:
+                m, sec = parts
+                total = float(m) * 60 + float(sec)
+                return -total if is_negative else total
+        except ValueError:
+            pass
+
+    # 2. 复合或单时间单位正则 (如 1h30m5s / 30m / 5s / 1.5h / 20分钟 / 30秒)
+    unit_pattern = re.compile(
+        r'^(?:(?P<hours>[\d\.]+)\s*(?:h|hr|hours?|小时))?'
+        r'(?:(?P<minutes>[\d\.]+)\s*(?:m|min|mins?|分|分钟))?'
+        r'(?:(?P<seconds>[\d\.]+)\s*(?:s|sec|secs?|秒))?$',
+        re.IGNORECASE
+    )
+    m = unit_pattern.match(s)
+    if m and any(m.groups()):
+        hours = float(m.group("hours") or 0.0)
+        minutes = float(m.group("minutes") or 0.0)
+        seconds = float(m.group("seconds") or 0.0)
+        total = hours * 3600 + minutes * 60 + seconds
+        return -total if is_negative else total
+
+    # 3. 纯秒数数值
+    try:
+        total = float(s)
+        return -total if is_negative else total
+    except ValueError:
+        raise ValueError(f"无法解析的时间格式: '{val}'。支持格式如 30m, 5s, 00:30:00, 1h20m, 1800 或 -5m")
 
 
 def safe_truncate_name(text: str, max_bytes: int = 200) -> str:
@@ -1171,7 +1249,8 @@ def derive_merged_output_path(
     output_target: Optional[Path],
     is_compressed: bool = True,
     default_ext: str = ".mp4",
-    keep_name: bool = False
+    keep_name: bool = False,
+    is_cut: bool = False
 ) -> Path:
     """智能推导多分卷合并后的输出路径与文件名。"""
     clean_stems = [get_clean_stem(p) for p in file_paths]
@@ -1189,7 +1268,14 @@ def derive_merged_output_path(
     else:
         derived = common
 
-    tag = "_compressed" if is_compressed else ""
+    if is_cut and is_compressed:
+        tag = "_cut_compressed"
+    elif is_cut:
+        tag = "_cut"
+    elif is_compressed:
+        tag = "_compressed"
+    else:
+        tag = ""
     suffix = default_ext if keep_name else f"_merged{tag}{default_ext}"
     default_filename = make_safe_filename(derived, suffix=suffix, max_total_bytes=240)
 
@@ -2520,9 +2606,12 @@ def process_video(
     max_ad_duration: float = 120.0,
     current_idx: int = 1,
     total_files: int = 1,
-    keep_name: bool = False
+    keep_name: bool = False,
+    ss: Optional[str] = None,
+    to: Optional[str] = None,
+    duration_limit: Optional[str] = None
 ) -> bool:
-    """处理单个视频文件（支持深度容错修复、智能去黑边、硬件极速压缩与本地 SSD 缓冲写入）。"""
+    """处理单个视频文件（支持深度容错修复、片段剪切、智能去黑边、硬件极速压缩与本地 SSD 缓冲写入）。"""
     print("=" * 70)
     print(f"[处理中] [{current_idx}/{total_files}] 文件: {file_path.resolve()}")
 
@@ -2531,7 +2620,7 @@ def process_video(
             current_file=file_path,
             file_index=current_idx,
             total_files=total_files,
-            stage="元数据探测与黑边分析"
+            stage="元数据探测与剪切/黑边分析"
         )
 
     salvaged_src_file: Optional[Path] = None
@@ -2567,6 +2656,103 @@ def process_video(
     width = info.get("width", 0)
     height = info.get("height", 0)
     duration = info.get("duration", 0.0)
+    if duration <= 0.0 and orig_bitrate > 0:
+        duration = (orig_size * 8.0) / orig_bitrate
+
+    # === 视频剪切参数解析与严格安全边界熔断校验 ===
+    has_trim = bool(ss or to or duration_limit)
+    start_sec = 0.0
+    end_sec = duration
+
+    if has_trim:
+        # 1. 解析起始时间
+        if ss:
+            try:
+                parsed_ss = parse_time_offset(ss)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切起始参数 --ss 格式非法: {e}", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_path, error_msg=str(e), action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                return False
+            if parsed_ss < 0:
+                if duration > 0:
+                    start_sec = max(0.0, duration + parsed_ss)
+                else:
+                    err_msg = f"无法探测视频时长，无法解析倒数起始时间: {ss}"
+                    print(f"\n  [错误] {err_msg}", file=sys.stderr)
+                    if vlog:
+                        vlog.log_failed(file_path, error_msg=err_msg, action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                    return False
+            else:
+                start_sec = parsed_ss
+
+        # 2. 解析截止时间
+        if to:
+            try:
+                parsed_to = parse_time_offset(to)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切截止参数 --to 格式非法: {e}", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_path, error_msg=str(e), action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                return False
+            if parsed_to < 0:
+                if duration > 0:
+                    end_sec = duration + parsed_to
+                else:
+                    err_msg = f"无法探测视频时长，无法解析倒数截止时间: {to}"
+                    print(f"\n  [错误] {err_msg}", file=sys.stderr)
+                    if vlog:
+                        vlog.log_failed(file_path, error_msg=err_msg, action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                    return False
+            else:
+                end_sec = parsed_to
+        elif duration_limit:
+            try:
+                parsed_dur = parse_time_offset(duration_limit)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切持续时长参数 -t / --duration 格式非法: {e}", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_path, error_msg=str(e), action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                return False
+            if parsed_dur <= 0:
+                err_msg = f"持续时长必须大于 0: {duration_limit}"
+                print(f"\n  [错误] {err_msg}", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_path, error_msg=err_msg, action="TRIM_INVALID", orig_size=orig_size, orig_info=info, tool="vfix")
+                return False
+            end_sec = start_sec + parsed_dur
+
+        # 3. 严格安全熔断机制：绝不产生空视频，绝不触碰或删除源文件
+        if duration > 0 and start_sec >= duration:
+            err_msg = (
+                f"剪切起始时间 ({format_time_str(start_sec)}) 大于或等于视频总时长 ({format_time_str(duration)})，"
+                f"触发安全熔断保护，跳过该文件并保留源文件不变"
+            )
+            print(f"\n  [安全熔断] {err_msg}", file=sys.stderr)
+            if vlog:
+                vlog.log_failed(file_path, error_msg=err_msg, action="TRIM_OUT_OF_BOUNDS", orig_size=orig_size, orig_info=info, tool="vfix")
+            return False
+
+        if end_sec <= start_sec:
+            err_msg = (
+                f"剪切截止时间 ({format_time_str(end_sec)}) 小于或等于起始时间 ({format_time_str(start_sec)})，"
+                f"有效剪切时长为 0，触发安全熔断保护"
+            )
+            print(f"\n  [安全熔断] {err_msg}", file=sys.stderr)
+            if vlog:
+                vlog.log_failed(file_path, error_msg=err_msg, action="TRIM_EMPTY_RANGE", orig_size=orig_size, orig_info=info, tool="vfix")
+            return False
+
+        if duration > 0 and end_sec > duration:
+            print(f"  * [提示] 剪切截止时间 ({format_time_str(end_sec)}) 超过视频总长 ({format_time_str(duration)})，已自动贴齐至片尾")
+            end_sec = duration
+
+        target_duration = max(0.1, end_sec - start_sec)
+        cut_intro = start_sec
+        cut_outro = max(0.0, duration - end_sec) if duration > 0 else 0.0
+        print(f"  * 剪切配置: 起点: {format_time_str(start_sec)} | 终点: {format_time_str(end_sec)} | 目标片段时长: {format_time_str(target_duration)} (去除: 开头 {format_time_str(cut_intro)}, 结尾 {format_time_str(cut_outro)})")
+    else:
+        target_duration = duration
 
     # 智能黑边探测与裁剪参数配置
     crop_info = None
@@ -2587,7 +2773,7 @@ def process_video(
                 file_path=file_path,
                 orig_w=width,
                 orig_h=height,
-                duration=duration,
+                duration=target_duration if has_trim else duration,
                 min_segment_duration=min_segment_duration,
                 target_aspect=aspect,
                 drop_ads=drop_ads,
@@ -2641,7 +2827,8 @@ def process_video(
                     orig_w=width,
                     orig_h=height,
                     duration=duration,
-                    target_aspect=aspect
+                    target_aspect=aspect,
+                    time_range=(start_sec, end_sec) if has_trim else None
                 )
                 detect_elapsed = time.time() - t_detect
 
@@ -2674,13 +2861,26 @@ def process_video(
     if orig_v_bitrate <= 0:
         orig_v_bitrate = orig_bitrate
 
-    # 策略决策：基于真实的视频规格与基准码率判定是否值得重新编码压缩
-    need_compress, reason = should_compress(
-        file_path, info, expected_bps, threshold, encoder, force_compress, force_repair_only
-    )
-    if crop_applied:
-        need_compress = True
-        reason = f"附带去黑边裁切并压缩 ({out_w}x{out_h})"
+    # 策略决策：
+    if has_trim:
+        # 用户在 grill-me 中明确决策：
+        # "默认不压缩，除非增加参数指定 可以和其他例如去黑边一起"
+        if crop_applied or force_compress:
+            need_compress = True
+            action_tag = "cut_compressed"
+            reason = f"剪切 ({format_time_str(start_sec)} -> {format_time_str(end_sec)}) 且附带{'去黑边' if crop_applied else '强制压缩'}"
+        else:
+            need_compress = False
+            action_tag = "cut"
+            reason = f"时间区间剪切 ({format_time_str(start_sec)} -> {format_time_str(end_sec)})，默认极速无损流复制"
+    else:
+        need_compress, reason = should_compress(
+            file_path, info, expected_bps, threshold, encoder, force_compress, force_repair_only
+        )
+        if crop_applied:
+            need_compress = True
+            reason = f"附带去黑边裁切并压缩 ({out_w}x{out_h})"
+        action_tag = "compressed" if need_compress else "repaired"
 
     codec = info.get("codec", "").lower()
     is_legacy = codec in LEGACY_INEFFICIENT_CODECS
@@ -2732,13 +2932,16 @@ def process_video(
             print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder}) | 目标码率: ~{format_bitrate(target_bps)}")
         else:
             print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset}) | 目标码率: ~{format_bitrate(target_bps)}")
-    policy_action = "修复并转码压缩" if need_compress else "极速无损换封装"
+
+    if has_trim:
+        policy_action = "精准转码剪切" if need_compress else "极速无损流复制剪切"
+    else:
+        policy_action = "修复并转码压缩" if need_compress else "极速无损换封装"
     print(f"  * 策略决策: [{policy_action}] -> {reason}")
-    if not need_compress and not force_repair_only:
+    if not need_compress and not force_repair_only and not has_trim:
         print(f"  * 提示: 该文件已处于工业级高兼容或高能效状态，若执意强制重新编码压制可添加参数: --force-compress")
 
     clean_stem = get_clean_stem(file_path)
-    action_tag = "compressed" if need_compress else "repaired"
     suffix = ".mp4" if keep_name else f"_{action_tag}.mp4"
 
     if output_dir:
@@ -2797,6 +3000,13 @@ def process_video(
         # -err_detect ignore_err: 解码时容忍并跳过损坏数据
         # -fflags +discardcorrupt: 容错丢弃不可恢复损坏包
         # -max_muxing_queue_size 2048: 防止音画错位导致队列溢出
+        seek_args = []
+        if has_trim:
+            if start_sec > 0:
+                seek_args.extend(["-ss", f"{start_sec:.3f}"])
+            if end_sec < duration:
+                seek_args.extend(["-to", f"{end_sec:.3f}"])
+
         effective_input = salvaged_src_file if (salvaged_src_file and salvaged_src_file.exists()) else file_path
         hw_decode_args = get_hwaccel_decode_args(effective_input, codec)
         base_args = (
@@ -2808,6 +3018,9 @@ def process_video(
                 "-max_error_rate", "1.0",
                 "-err_detect", "ignore_err",
                 "-fflags", "+discardcorrupt",
+            ]
+            + seek_args
+            + [
                 "-i", str(effective_input),
                 "-max_muxing_queue_size", "2048"
             ]
@@ -2820,6 +3033,7 @@ def process_video(
             "-max_error_rate", "1.0",
             "-err_detect", "ignore_err",
             "-fflags", "+discardcorrupt+genpts",
+        ] + seek_args + [
             "-i", str(effective_input),
             "-max_muxing_queue_size", "2048"
         ]
@@ -2853,8 +3067,14 @@ def process_video(
                         "-max_error_rate", "1.0",
                         "-err_detect", "ignore_err",
                         "-fflags", "+discardcorrupt",
+                    ]
+                    + seek_args
+                    + [
                         "-i", str(file_path),
                         "-err_detect", "ignore_err",
+                    ]
+                    + seek_args
+                    + [
                         "-i", str(salvaged_audio_file),
                         "-max_muxing_queue_size", "2048"
                     ]
@@ -2866,8 +3086,10 @@ def process_video(
                     "-max_error_rate", "1.0",
                     "-err_detect", "ignore_err",
                     "-fflags", "+discardcorrupt+genpts",
+                ] + seek_args + [
                     "-i", str(file_path),
                     "-err_detect", "ignore_err",
+                ] + seek_args + [
                     "-i", str(salvaged_audio_file),
                     "-max_muxing_queue_size", "2048"
                 ]
@@ -2893,8 +3115,8 @@ def process_video(
         last_err_msg = ""
 
         if not need_compress:
-            # === 仅修复/无损换封装模式：尝试极速流复制 ===
-            if salvaged_src_file and salvaged_src_file.exists():
+            # === 仅修复/无损换封装/无损剪切模式：尝试极速流复制 ===
+            if salvaged_src_file and salvaged_src_file.exists() and not has_trim:
                 print(f"  * 抢救重构产物已为标准高兼容 MP4，准备归档: {output_name}")
                 safe_move_file(salvaged_src_file, temp_output_file)
                 success = True
@@ -2902,12 +3124,13 @@ def process_video(
             else:
                 tag_args = ["-tag:v", "hvc1"] if codec in ("hevc", "h265") else []
                 cmd_copy = base_args + map_args + ["-c:v", "copy"] + tag_args + audio_args + [
+                    "-avoid_negative_ts", "make_zero",
                     "-movflags", "+faststart",
                     str(temp_output_file)
                 ]
                 success, last_err_msg = execute_ffmpeg(
                     cmd_copy,
-                    duration=duration,
+                    duration=target_duration,
                     current_file=file_path,
                     current_idx=current_idx,
                     total_files=total_files
@@ -2918,6 +3141,11 @@ def process_video(
             keyint_min = max(15, int(fps_val))
 
             if not success:
+                reason_snippet = last_err_msg.strip().splitlines()[-1] if last_err_msg.strip() else "时间戳/封装限制"
+                if has_trim:
+                    print(f"  [提示] 无损流复制剪切未通过 ({reason_snippet})，自动平滑切换至硬件/CPU精准转码剪切...")
+                else:
+                    print(f"  [提示] 格式限制或无损流复制未通过 ({reason_snippet})，自动平滑切换至转码修复...")
                 # 格式不兼容时（如 WMV 视频编码无法直接封装进 MP4），自动启动转码修复
                 video_encode_args = build_video_encode_args(
                     encoder=encoder,
@@ -2937,7 +3165,7 @@ def process_video(
                 ]
                 success, last_err_msg = execute_ffmpeg(
                     cmd_transcode,
-                    duration=duration,
+                    duration=target_duration,
                     current_file=file_path,
                     current_idx=current_idx,
                     total_files=total_files
@@ -2961,7 +3189,7 @@ def process_video(
                     ]
                     success, last_err_msg = execute_ffmpeg(
                         cmd_transcode_sw,
-                        duration=duration,
+                        duration=target_duration,
                         current_file=file_path,
                         current_idx=current_idx,
                         total_files=total_files
@@ -2991,7 +3219,7 @@ def process_video(
             ]
             success, last_err_msg = execute_ffmpeg(
                 cmd_compress,
-                duration=duration,
+                duration=target_duration,
                 current_file=file_path,
                 current_idx=current_idx,
                 total_files=total_files
@@ -3007,7 +3235,7 @@ def process_video(
                 ]
                 success, last_err_msg = execute_ffmpeg(
                     cmd_compress_fallback,
-                    duration=duration,
+                    duration=target_duration,
                     current_file=file_path,
                     current_idx=current_idx,
                     total_files=total_files
@@ -3025,7 +3253,7 @@ def process_video(
                 last_err_msg = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
             else:
                 out_dur = out_probe.get("duration", 0.0)
-                ref_dur = duration
+                ref_dur = target_duration if has_trim else duration
                 if ref_dur <= 0.0 and orig_bitrate > 0:
                     ref_dur = (orig_size * 8.0) / orig_bitrate
 
@@ -3033,7 +3261,7 @@ def process_video(
                     if out_dur < (ref_dur * 0.94) and (ref_dur - out_dur) > 4.0:
                         is_truncated = True
                         last_err_msg = (
-                            f"产物严重过早截断！源时长: {ref_dur:.1f}s ({ref_dur/60:.1f}m)，"
+                            f"产物严重过早截断！预期时长: {ref_dur:.1f}s ({ref_dur/60:.1f}m)，"
                             f"转码产物仅: {out_dur:.1f}s ({out_dur/60:.1f}m)，"
                             f"丢失时长: {(ref_dur - out_dur):.1f}s (缺失率: {((ref_dur - out_dur) / ref_dur * 100):.1f}%)"
                         )
@@ -3065,7 +3293,7 @@ def process_video(
             ]
             success, last_err_msg = execute_ffmpeg(
                 cmd_sw_fallback,
-                duration=duration,
+                duration=target_duration,
                 current_file=file_path,
                 current_idx=current_idx,
                 total_files=total_files
@@ -3078,12 +3306,12 @@ def process_video(
                     last_err_msg = "CPU 软件转码产物无有效视频流"
                 else:
                     out_dur = out_probe.get("duration", 0.0)
-                    ref_dur = duration
+                    ref_dur = target_duration if has_trim else duration
                     if ref_dur <= 0.0 and orig_bitrate > 0:
                         ref_dur = (orig_size * 8.0) / orig_bitrate
                     if ref_dur > 15.0 and out_dur > 0.0 and out_dur < (ref_dur * 0.94) and (ref_dur - out_dur) > 4.0:
                         is_truncated = True
-                        last_err_msg = f"CPU 软件转码后依然截断 (源时长: {ref_dur:.1f}s, 产物仅: {out_dur:.1f}s)！原片损坏严重"
+                        last_err_msg = f"CPU 软件转码后依然截断 (预期时长: {ref_dur:.1f}s, 产物仅: {out_dur:.1f}s)！原片损坏严重"
                         success = False
             else:
                 success = False
@@ -3098,7 +3326,7 @@ def process_video(
             salvaged_candidate = make_safe_temp_path(temp_dir, f"vfix_salvaged_{os.getpid()}_", clean_stem, suffix=".mp4", max_total_bytes=240)
             if salvage_corrupted_mp4(file_path, salvaged_candidate):
                 salvaged_src_file = salvaged_candidate
-                if not need_compress:
+                if not need_compress and not has_trim:
                     print(f"  * 抢救重构产物已为标准高兼容 MP4，准备归档: {output_name}")
                     safe_move_file(salvaged_src_file, temp_output_file)
                     success = True
@@ -3106,7 +3334,8 @@ def process_video(
                 else:
                     cmd_retry = [
                         "ffmpeg", "-y",
-                        "-hide_banner", "-loglevel", "error",
+                        "-hide_banner", "-loglevel", "error"
+                    ] + seek_args + [
                         "-i", str(salvaged_src_file)
                     ] + map_args + vf_fix_args + video_encode_args + audio_args + [
                         "-avoid_negative_ts", "make_zero",
@@ -3115,7 +3344,7 @@ def process_video(
                     ]
                     success, last_err_msg = execute_ffmpeg(
                         cmd_retry,
-                        duration=duration,
+                        duration=target_duration,
                         current_file=file_path,
                         current_idx=current_idx,
                         total_files=total_files
@@ -3124,8 +3353,8 @@ def process_video(
         if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
             new_size = temp_output_file.stat().st_size
 
-            # 兜底防膨胀：若压缩后的体积居然大于原文件
-            if need_compress and new_size > orig_size and orig_size > 0:
+            # 兜底防膨胀：若压缩后的体积居然大于原文件 (仅在非剪切场景下)
+            if not has_trim and need_compress and new_size > orig_size and orig_size > 0:
                 codec = info.get("codec", "").lower()
                 name_lower = file_path.name.lower()
                 is_part_file = any(name_lower.endswith(ext) for ext in TEMP_DOWNLOAD_EXTENSIONS)
@@ -3135,7 +3364,7 @@ def process_video(
                     cmd_protect = base_args + map_args + ["-c:v", "copy"] + audio_args + ["-movflags", "+faststart", str(temp_output_file)]
                     success_p, _ = execute_ffmpeg(
                         cmd_protect,
-                        duration=duration,
+                        duration=target_duration,
                         current_file=file_path,
                         current_idx=current_idx,
                         total_files=total_files
@@ -3163,7 +3392,7 @@ def process_video(
                     ]
                     success_c, _ = execute_ffmpeg(
                         cmd_compact,
-                        duration=duration,
+                        duration=target_duration,
                         current_file=file_path,
                         current_idx=current_idx,
                         total_files=total_files
@@ -3197,10 +3426,19 @@ def process_video(
                 # 将本地 SSD 临时生成的文件安全移动到目标位置（支持跨文件系统/SMB共享盘，规避 macOS fcopyfile ENXIO 缺陷）
                 safe_move_file(temp_output_file, final_output_file)
 
-            action_desc = "修复与压缩" if need_compress else "极速无损换封装"
-            size_label = "压缩后大小" if need_compress else "换封装后大小"
+            if has_trim:
+                action_desc = "精准转码剪切" if need_compress else "极速无损流复制剪切"
+                size_label = "剪切后大小"
+                vlog_action = "TRIM_COMPRESS" if need_compress else "TRIM_COPY"
+            else:
+                action_desc = "修复与压缩" if need_compress else "极速无损换封装"
+                size_label = "压缩后大小" if need_compress else "换封装后大小"
+                vlog_action = "COMPRESS" if need_compress else "REPACKAGE"
+
             print(f"[完成] {action_desc}成功! 耗时: {duration_sec:.1f}s")
             print(f"  * 原始大小: {format_bytes(orig_size)} -> {size_label}: {format_bytes(new_size)} ({size_change:+.1f}%)")
+            if has_trim:
+                print(f"  * 剪切时长: {format_time_str(duration)} -> {format_time_str(target_duration)} (去除: 开头 {format_time_str(cut_intro)}, 结尾 {format_time_str(cut_outro)})")
             print(f"  * 输出路径: {final_output_file.resolve()}")
             if vlog:
                 detail_suffix = ""
@@ -3210,7 +3448,7 @@ def process_video(
                     input_file=file_path,
                     output_target=final_output_file,
                     status="SUCCESS",
-                    action="COMPRESS" if need_compress else "REPACKAGE",
+                    action=vlog_action,
                     orig_size=orig_size,
                     new_size=new_size,
                     elapsed_sec=duration_sec,
@@ -3260,7 +3498,10 @@ def process_merged_videos(
     delete_source: bool = False,
     crop: Optional[str] = None,
     aspect: Optional[str] = None,
-    keep_name: bool = False
+    keep_name: bool = False,
+    ss: Optional[str] = None,
+    to: Optional[str] = None,
+    duration_limit: Optional[str] = None
 ) -> bool:
     """多分卷视频智能对齐合并与硬件/软件容错编码压缩 (支持极速无损流复制合并与 Filter Concat Pipeline)。"""
     is_merge_only = merge_only or force_repair_only
@@ -3442,8 +3683,65 @@ def process_merged_videos(
     else:
         target_ext = ".mp4"
 
+    # === 视频剪切参数解析与安全校验 ===
+    has_trim = bool(ss or to or duration_limit)
+    total_orig_duration = sum(p.get("duration", 0.0) for p in probes)
+    start_sec = 0.0
+    end_sec = total_orig_duration
+
+    if has_trim:
+        if ss:
+            try:
+                parsed_ss = parse_time_offset(ss)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切起始参数 --ss 格式非法: {e}", file=sys.stderr)
+                return False
+            start_sec = max(0.0, total_orig_duration + parsed_ss) if parsed_ss < 0 and total_orig_duration > 0 else (parsed_ss if parsed_ss >= 0 else 0.0)
+        if to:
+            try:
+                parsed_to = parse_time_offset(to)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切截止参数 --to 格式非法: {e}", file=sys.stderr)
+                return False
+            end_sec = total_orig_duration + parsed_to if parsed_to < 0 and total_orig_duration > 0 else (parsed_to if parsed_to >= 0 else total_orig_duration)
+        elif duration_limit:
+            try:
+                parsed_dur = parse_time_offset(duration_limit)
+            except ValueError as e:
+                print(f"\n  [错误] 剪切持续时长参数 -t / --duration 格式非法: {e}", file=sys.stderr)
+                return False
+            end_sec = start_sec + parsed_dur
+
+        if total_orig_duration > 0 and start_sec >= total_orig_duration:
+            err_msg = f"剪切起始时间 ({format_time_str(start_sec)}) 超过总时长 ({format_time_str(total_orig_duration)})"
+            print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
+            if vlog:
+                vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_OUT_OF_BOUNDS", orig_size=total_orig_size, tool="vfix")
+            return False
+        if end_sec <= start_sec:
+            err_msg = f"剪切截止时间 ({format_time_str(end_sec)}) 小于或等于起始时间 ({format_time_str(start_sec)})"
+            print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
+            if vlog:
+                vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_EMPTY_RANGE", orig_size=total_orig_size, tool="vfix")
+            return False
+        if total_orig_duration > 0 and end_sec > total_orig_duration:
+            end_sec = total_orig_duration
+        target_merged_dur = max(0.1, end_sec - start_sec)
+        cut_intro = start_sec
+        cut_outro = max(0.0, total_orig_duration - end_sec) if total_orig_duration > 0 else 0.0
+        print(f"  * 合并剪切配置: 起点: {format_time_str(start_sec)} | 终点: {format_time_str(end_sec)} | 目标片段时长: {format_time_str(target_merged_dur)} (去除: 开头 {format_time_str(cut_intro)}, 结尾 {format_time_str(cut_outro)})")
+    else:
+        target_merged_dur = total_orig_duration
+
+    concat_seek_args = []
+    if has_trim:
+        if start_sec > 0:
+            concat_seek_args.extend(["-ss", f"{start_sec:.3f}"])
+        if total_orig_duration > 0 and end_sec < total_orig_duration:
+            concat_seek_args.extend(["-to", f"{end_sec:.3f}"])
+
     final_output_file = derive_merged_output_path(
-        file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name
+        file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name, is_cut=has_trim
     )
     final_output_file.parent.mkdir(parents=True, exist_ok=True)
     temp_output_file = make_safe_temp_path(
@@ -3531,7 +3829,8 @@ def process_merged_videos(
                     "-fflags", "+discardcorrupt",
                     "-f", "concat",
                     "-safe", "0",
-                    "-i", str(concat_list_file),
+                    "-i", str(concat_list_file)
+                ] + concat_seek_args + [
                     "-c:v", "copy"
                 ]
 
@@ -3554,19 +3853,45 @@ def process_merged_videos(
 
                 cmd_fast.append(str(temp_output_file))
 
-                action_intro = "[单独合并]" if is_merge_only else "[分卷规整合并]"
+                if has_trim:
+                    action_intro = "[分卷合并与剪切]"
+                elif is_merge_only:
+                    action_intro = "[单独合并]"
+                else:
+                    action_intro = "[分卷规整合并]"
                 print(f"  * 策略决策: {action_intro} -> 启动极速无损流复制合并 (-c:v copy，跳过视频重编码)...")
                 t_start = time.time()
-                success_fast, fast_err = execute_ffmpeg(cmd_fast)
+                success_fast, fast_err = execute_ffmpeg(cmd_fast, duration=target_merged_dur)
 
+                is_fast_truncated = False
                 if success_fast and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+                    out_probe = probe_video(temp_output_file)
+                    if not out_probe or not out_probe.get("width"):
+                        success_fast = False
+                        fast_err = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
+                    else:
+                        out_dur = out_probe.get("duration", 0.0)
+                        if target_merged_dur > 15.0 and out_dur > 0.0:
+                            if out_dur < (target_merged_dur * 0.94) and (target_merged_dur - out_dur) > 4.0:
+                                is_fast_truncated = True
+                                fast_err = (
+                                    f"流复制剪切截断异常！预期时长: {target_merged_dur:.1f}s，"
+                                    f"产物仅: {out_dur:.1f}s"
+                                )
+
+                if success_fast and not is_fast_truncated and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                     duration_sec = time.time() - t_start
                     new_size = temp_output_file.stat().st_size
                     size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
 
                     safe_move_file(temp_output_file, final_output_file)
 
-                    done_label = "单独合并成功" if is_merge_only else "合并成功 (分卷码率已在合理区间，免二次压缩)"
+                    if has_trim:
+                        done_label = "分卷合并与剪切成功"
+                    elif is_merge_only:
+                        done_label = "单独合并成功"
+                    else:
+                        done_label = "合并成功 (分卷码率已在合理区间，免二次压缩)"
                     print(f"[完成] {done_label} (极速无损流复制)! 耗时: {duration_sec:.1f}s")
                     print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
                     print(f"  * 输出路径: {final_output_file}")
@@ -3575,12 +3900,12 @@ def process_merged_videos(
                             input_file=file_paths,
                             output_target=final_output_file,
                             status="SUCCESS",
-                            action="MERGE_ONLY" if is_merge_only else "MERGE_STREAM_COPY",
+                            action="MERGE_TRIM_STREAM_COPY" if has_trim else ("MERGE_ONLY" if is_merge_only else "MERGE_STREAM_COPY"),
                             orig_size=total_orig_size,
                             new_size=new_size,
                             elapsed_sec=duration_sec,
                             orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
-                            details=f"极速无损流复制合并 ({n_files} 个分卷)",
+                            details=f"极速无损流复制合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
                             tool="vfix"
                         )
                     if keep_name and not delete_source:
@@ -3633,12 +3958,15 @@ def process_merged_videos(
                     f"{merge_crop_filter}scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
                     f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},setpts=PTS-STARTPTS"
                 )
-            cmd_concat_transcode = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
-                "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
-                "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-                "-vf", vf_filter
-            ]
+            cmd_concat_transcode = (
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
+                    "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
+                    "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+                    "-vf", vf_filter
+                ]
+                + concat_seek_args
+            )
             if has_any_audio:
                 cmd_concat_transcode += [
                     "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
@@ -3653,16 +3981,19 @@ def process_merged_videos(
             )
 
             t_start = time.time()
-            success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode)
+            success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode, duration=target_merged_dur)
 
             if not success_tc and is_hardware:
                 print("  [提示] 硬件编码拼接异常，自动平滑切换至 CPU 软件编码 (libx264)...")
-                cmd_concat_transcode_sw = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
-                    "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
-                    "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-                    "-vf", vf_filter
-                ]
+                cmd_concat_transcode_sw = (
+                    [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
+                        "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
+                        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+                        "-vf", vf_filter
+                    ]
+                    + concat_seek_args
+                )
                 if has_any_audio:
                     cmd_concat_transcode_sw += [
                         "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
@@ -3675,7 +4006,7 @@ def process_merged_videos(
                     sw_video_args
                     + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
                 )
-                success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode_sw)
+                success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode_sw, duration=target_merged_dur)
 
             if success_tc and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                 duration_sec = time.time() - t_start
@@ -3684,7 +4015,10 @@ def process_merged_videos(
 
                 safe_move_file(temp_output_file, final_output_file)
 
-                action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
+                if has_trim:
+                    action_label = "多分卷合并剪切与压缩" if not is_merge_only else "多分卷合并与剪切"
+                else:
+                    action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
                 print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
                 print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
                 print(f"  * 输出路径: {final_output_file}")
@@ -3693,12 +4027,12 @@ def process_merged_videos(
                         input_file=file_paths,
                         output_target=final_output_file,
                         status="SUCCESS",
-                        action="MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS",
+                        action="MERGE_TRIM_COMPRESS" if has_trim else ("MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS"),
                         orig_size=total_orig_size,
                         new_size=new_size,
                         elapsed_sec=duration_sec,
                         orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
-                        details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷)",
+                        details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
                         tool="vfix"
                     )
                 if keep_name and not delete_source:
@@ -3810,6 +4144,7 @@ def process_merged_videos(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0"]
         + input_args
         + ["-filter_complex", filter_complex, "-map", "[v]"]
+        + concat_seek_args
         + video_encode_args
         + audio_encode_args
         + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
@@ -3817,7 +4152,7 @@ def process_merged_videos(
 
     try:
         t_start = time.time()
-        success, last_err_msg = execute_ffmpeg(cmd_merge)
+        success, last_err_msg = execute_ffmpeg(cmd_merge, duration=target_merged_dur)
 
         # 硬件编码遇异常时的软解回退
         if not success and is_hardware:
@@ -3826,11 +4161,12 @@ def process_merged_videos(
                 ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0"]
                 + input_args
                 + ["-filter_complex", filter_complex, "-map", "[v]"]
+                + concat_seek_args
                 + sw_video_args
                 + audio_encode_args
                 + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
             )
-            success, last_err_msg = execute_ffmpeg(cmd_sw_merge)
+            success, last_err_msg = execute_ffmpeg(cmd_sw_merge, duration=target_merged_dur)
 
         # 极端情况：若音频合成依然异常，自动降级为纯画面抢救合并 (-an)
         if not success and has_any_audio:
@@ -3858,10 +4194,11 @@ def process_merged_videos(
                 ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0"]
                 + an_inputs
                 + ["-filter_complex", an_fc, "-map", "[v]"]
+                + concat_seek_args
                 + (sw_video_args if is_hardware else video_encode_args)
                 + ["-an", "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
             )
-            success, last_err_msg = execute_ffmpeg(cmd_an_merge)
+            success, last_err_msg = execute_ffmpeg(cmd_an_merge, duration=target_merged_dur)
 
         duration_sec = time.time() - t_start
 
@@ -3871,7 +4208,10 @@ def process_merged_videos(
 
             safe_move_file(temp_output_file, final_output_file)
 
-            action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
+            if has_trim:
+                action_label = "多分卷合并剪切与压缩" if not is_merge_only else "多分卷合并与剪切"
+            else:
+                action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
             print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
             print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
             print(f"  * 输出路径: {final_output_file}")
@@ -3880,12 +4220,12 @@ def process_merged_videos(
                     input_file=file_paths,
                     output_target=final_output_file,
                     status="SUCCESS",
-                    action="MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS",
+                    action="MERGE_TRIM_COMPRESS" if has_trim else ("MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS"),
                     orig_size=total_orig_size,
                     new_size=new_size,
                     elapsed_sec=duration_sec,
                     orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
-                    details=f"多源滤镜对齐拼接合并 ({n_files} 个分卷)",
+                    details=f"多源滤镜对齐拼接合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
                     tool="vfix"
                 )
             if keep_name and not delete_source:
@@ -3975,6 +4315,49 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
                     i += 2
                     continue
             norm_args.append("-c")
+            i += 1
+            continue
+
+        # 容错：视频剪切相关参数 (-ss, -to, -duration 等，支持类似 --to -5m 的负数值通过 = 强绑定绕过 Python 3.9 argparse 限制)
+        if arg in ("-ss", "--ss", "--start"):
+            if i + 1 < len(raw_args):
+                norm_args.append(f"--ss={raw_args[i + 1]}")
+                i += 2
+                continue
+            norm_args.append("--ss")
+            i += 1
+            continue
+        if arg.startswith(("-ss=", "--ss=", "--start=")):
+            val = arg.split("=", 1)[1]
+            norm_args.append(f"--ss={val}")
+            i += 1
+            continue
+
+        if arg in ("-to", "--to", "--end"):
+            if i + 1 < len(raw_args):
+                norm_args.append(f"--to={raw_args[i + 1]}")
+                i += 2
+                continue
+            norm_args.append("--to")
+            i += 1
+            continue
+        if arg.startswith(("-to=", "--to=", "--end=")):
+            val = arg.split("=", 1)[1]
+            norm_args.append(f"--to={val}")
+            i += 1
+            continue
+
+        if arg in ("-t", "--duration", "-duration"):
+            if i + 1 < len(raw_args):
+                norm_args.append(f"--duration={raw_args[i + 1]}")
+                i += 2
+                continue
+            norm_args.append("--duration")
+            i += 1
+            continue
+        if arg.startswith(("-t=", "--duration=", "-duration=")):
+            val = arg.split("=", 1)[1]
+            norm_args.append(f"--duration={val}")
             i += 1
             continue
 
@@ -4217,7 +4600,12 @@ def main():
 7. 仅修复容器封装损坏（不改变画质、不耗费重编码时间）:
    vfix broken_index.mp4 --force-repair-only
 
-8. 后台脱机批量运行与状态管理 (多任务/长耗时必备，关闭终端/断开SSH不中断):
+8. 视频片段精确剪切与片头片尾剔除 (遵循 FFmpeg 语法，默认无损极速流复制):
+   vfix video.mp4 -ss 30m -to -5m               # 快速剪切：去掉开头30分钟和结尾5分钟 (默认极速无损流复制，0重编码、秒级完成)
+   vfix video.mp4 -ss 30m -to -5m -c            # 剪切的同时智能去除黑边并重新压缩
+   vfix video.mp4 -ss 00:10:00 -to 00:45:00 -k  # 截取 10~45 分钟片段，原名就地保存
+
+9. 后台脱机批量运行与状态管理 (多任务/长耗时必备，关闭终端/断开SSH不中断):
    vfix *.part -d -B                            # 后台脱机运行，终端即刻释放
    vfix /mnt/nas/videos/ -r -d -B               # 后台脱机递归处理整个目录并安全清理源文件
    vfix --status                                # 实时查看后台任务运行状态、当前进度与最新日志
@@ -4270,6 +4658,15 @@ def main():
                         help="判定为广告/插片的最大时长阈值/秒 (默认 120.0 秒)")
     parser.add_argument("--min-segment-duration", type=float, default=12.0,
                         help="切片最小片段时长/秒 (默认 12.0 秒，短镜头自动并入相邻主画幅)")
+
+    # 视频剪切与片段截取
+    trim_group = parser.add_argument_group("视频剪切与片段截取 (遵循 FFmpeg 语法体系，默认无损极速流复制，亦可配合压缩/去黑边)")
+    trim_group.add_argument("-ss", "--ss", "--start", dest="ss", type=str, default=None,
+                            help="剪切起始时间 (例如: 30m, 5s, 00:30:00, 1800；默认从片头开始)")
+    trim_group.add_argument("-to", "--to", "--end", dest="to", type=str, default=None,
+                            help="剪切截止时间。正数表示原片绝对时刻 (如 45m、01:15:00)；负数表示距片尾倒数时间 (如 -5m 表示截取到片尾前5分钟)")
+    trim_group.add_argument("-t", "--duration", dest="duration", type=str, default=None,
+                            help="截取的持续时长 (例如: 15m, 300s；与 --to 互斥或作为其替代)")
 
     # 编码与画质调优
     parser.add_argument("--crf", type=int, default=22,
@@ -4395,7 +4792,10 @@ def main():
                 max_ad_duration=args.max_ad_duration,
                 current_idx=1,
                 total_files=1,
-                keep_name=args.keep_name
+                keep_name=args.keep_name,
+                ss=args.ss,
+                to=args.to,
+                duration_limit=args.duration
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4422,7 +4822,10 @@ def main():
                 delete_source=args.delete_source,
                 crop=crop_setting,
                 aspect=args.aspect,
-                keep_name=args.keep_name
+                keep_name=args.keep_name,
+                ss=args.ss,
+                to=args.to,
+                duration_limit=args.duration
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4464,7 +4867,10 @@ def main():
             max_ad_duration=args.max_ad_duration,
             current_idx=idx,
             total_files=len(video_files),
-            keep_name=args.keep_name
+            keep_name=args.keep_name,
+            ss=args.ss,
+            to=args.to,
+            duration_limit=args.duration
         )
         if ok:
             success_count += 1
@@ -4486,6 +4892,8 @@ def main():
         print(f"  * 失败任务明细见: {vlog.get_failed_log_path()} [独立记录]")
     if not args.no_log:
         print(f"  * 运行与删除日志: {vlog.get_log_dir()}/ (processed.log / failed.log / deleted.log / vfix.log)")
+    if fail_count > 0 and success_count == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

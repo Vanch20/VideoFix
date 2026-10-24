@@ -217,7 +217,12 @@ def log_processed(
             size_str = f"{format_bytes(orig_size)} -> {format_bytes(new_size)} ({change_pct:+.1f}%{saved_str})"
 
     # 耗时格式化
-    cost_str = f"{elapsed_sec:.1f}s" if elapsed_sec is not None else "未知"
+    if isinstance(elapsed_sec, (int, float)):
+        cost_str = f"{elapsed_sec:.1f}s"
+    elif elapsed_sec is not None:
+        cost_str = str(elapsed_sec)
+    else:
+        cost_str = "未知"
 
     # 原始音视频参数摘要
     media_specs = []
