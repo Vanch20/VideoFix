@@ -44,7 +44,7 @@ import time
 import unicodedata
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
 
 # 智能去黑边配套模块 (支持自动过滤跑马灯广告/水印及短剧画幅锁定与智能场景切片)
 try:
@@ -73,6 +73,18 @@ except ImportError:
         parse_aspect_ratio = None
         detect_scene_segments = None
         process_video_with_splits = None
+
+# 智能字幕提取配套模块 (支持自动语音识别与字幕导出)
+try:
+    from video_subtitles import extract_subtitles_for_file
+except ImportError:
+    _vfix_dir = Path(__file__).resolve().parent
+    if str(_vfix_dir) not in sys.path:
+        sys.path.insert(0, str(_vfix_dir))
+    try:
+        from video_subtitles import extract_subtitles_for_file
+    except ImportError:
+        extract_subtitles_for_file = None
 
 import atexit
 import signal
@@ -996,15 +1008,6 @@ def make_safe_filename(stem: str, suffix: str = ".mp4", max_total_bytes: int = 2
     return f"{safe_stem}{suffix}"
 
 
-def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
-    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes。"""
-    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
-    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
-    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
-    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
-    return temp_dir / f"{prefix}{safe_stem}{suffix}"
-
-
 def safe_path_exists(p: Optional[Path]) -> bool:
     """安全判定文件是否存在，吸收并防御任何底层文件名过长 (ENAMETOOLONG / Errno 36) 或权限异常。"""
     if p is None:
@@ -1016,13 +1019,226 @@ def safe_path_exists(p: Optional[Path]) -> bool:
 
 
 def safe_path_unlink(p: Optional[Path]) -> None:
-    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常。"""
+    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常，并自动从临时文件管理器中注销。"""
     if p is None:
         return
+    try:
+        TempFileManager.unregister(p)
+    except Exception:
+        pass
     try:
         p.unlink(missing_ok=True)
     except (OSError, ValueError):
         pass
+
+
+class TempFileManager:
+    """全局临时文件生命周期管理与安全回收中心：
+    1. 实时跟踪当前进程所有生成的临时文件 (register / unregister)；
+    2. atexit 与系统信号 (SIGINT/SIGTERM/SIGHUP) 自动兜底回收，绝不残留半拉子文件；
+    3. 启动与退出时智能发现并清理历史遗留的僵尸临时文件 (Dead PID 清理)；
+    4. 智能挑选最优临时存储分区 (自动规避小容量 tmpfs 内存盘，首选大容量持久存储如 ~/.vfix/tmp 或 /var/tmp)。
+    """
+    _registered_files: Set[Path] = set()
+    _lock = threading.Lock()
+    _stale_cleaned_at_startup = False
+
+    PATTERNS = [
+        re.compile(r"^vrc_(?:merge_)?(?:salvage_)?(?:concat_)?(\d+)_"),
+        re.compile(r"^_vfix_.*_(\d+)\."),
+        re.compile(r"^vfix_salvaged_(\d+)_"),
+        re.compile(r"^vcrop_(?:split_)?(\d+)_"),
+        re.compile(r"^untrunc_salvage_(\d+)_"),
+        re.compile(r"\.vfix_tmp\.(\d+)$"),
+        re.compile(r"\.vcrop_tmp\.(\d+)$"),
+    ]
+
+    @classmethod
+    def register(cls, path: Optional[Union[str, Path]]) -> Optional[Path]:
+        if path is None:
+            return None
+        try:
+            p = Path(path).resolve()
+            with cls._lock:
+                cls._registered_files.add(p)
+            return p
+        except Exception:
+            return Path(path) if isinstance(path, str) else path
+
+    @classmethod
+    def unregister(cls, path: Optional[Union[str, Path]]) -> None:
+        if path is None:
+            return
+        try:
+            p = Path(path).resolve()
+            with cls._lock:
+                cls._registered_files.discard(p)
+        except Exception:
+            pass
+
+    @classmethod
+    def safe_unlink(cls, path: Optional[Union[str, Path]]) -> None:
+        """安全删除临时文件并从注册表中注销"""
+        if path is None:
+            return
+        cls.unregister(path)
+        safe_path_unlink(path)
+
+    @classmethod
+    def cleanup_active(cls) -> int:
+        """清理当前进程所有尚未归档的活动临时文件"""
+        with cls._lock:
+            files_to_clean = list(cls._registered_files)
+            cls._registered_files.clear()
+        cleaned_count = 0
+        for p in files_to_clean:
+            if safe_path_exists(p):
+                try:
+                    p.unlink(missing_ok=True)
+                    cleaned_count += 1
+                except Exception:
+                    pass
+        return cleaned_count
+
+    @classmethod
+    def is_pid_alive(cls, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as err:
+            return err.errno == errno.EPERM
+
+    @classmethod
+    def cleanup_stale_temp_files(cls, custom_dirs: Optional[List[Union[str, Path]]] = None, verbose: bool = False) -> Tuple[int, int]:
+        """全自动扫描并彻底清除因断电、崩溃、中断遗留的僵尸临时文件。
+        返回: (清理文件数, 释放字节数)
+        """
+        dirs_to_check = set()
+        if custom_dirs:
+            for d in custom_dirs:
+                if d:
+                    try:
+                        dirs_to_check.add(Path(d).expanduser().resolve())
+                    except Exception:
+                        pass
+
+        # 候选临时目录集合
+        env_dir = os.environ.get("VFIX_TEMP_DIR")
+        if env_dir:
+            try:
+                dirs_to_check.add(Path(env_dir).expanduser().resolve())
+            except Exception:
+                pass
+        dirs_to_check.add(Path.home() / ".vfix" / "tmp")
+        dirs_to_check.add(Path("/var/tmp"))
+        dirs_to_check.add(Path(tempfile.gettempdir()))
+
+        cleaned_count = 0
+        cleaned_bytes = 0
+        current_pid = os.getpid()
+
+        for d in dirs_to_check:
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for item in d.iterdir():
+                    if not item.is_file():
+                        continue
+                    name = item.name
+
+                    matched_pid = None
+                    for pat in cls.PATTERNS:
+                        m = pat.search(name)
+                        if m:
+                            matched_pid = int(m.group(1))
+                            break
+
+                    is_stale = False
+                    reason = ""
+
+                    if matched_pid is not None:
+                        # 属于其他进程，且该进程已死亡
+                        if matched_pid != current_pid and not cls.is_pid_alive(matched_pid):
+                            is_stale = True
+                            reason = f"属主进程 PID {matched_pid} 已退出"
+                    elif name.startswith(("vrc_", "_vfix_", "vcrop_", "untrunc_salvage_")) or name == "sps_pps_tmp.h264":
+                        try:
+                            age = time.time() - item.stat().st_mtime
+                            if age > 1800:  # 超过 30 分钟未更新的临时残余文件
+                                is_stale = True
+                                reason = f"过期残留 ({age/60:.0f} 分钟前生成)"
+                        except Exception:
+                            pass
+
+                    if is_stale:
+                        try:
+                            f_size = item.stat().st_size
+                            item.unlink(missing_ok=True)
+                            cleaned_count += 1
+                            cleaned_bytes += f_size
+                            if verbose:
+                                print(f"  * [清理垃圾] {item} ({format_bytes(f_size)}, 原因: {reason})")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return cleaned_count, cleaned_bytes
+
+    @classmethod
+    def get_optimal_temp_dir(cls, needed_bytes: int = 0) -> Path:
+        """智能挑选最优临时存储目录，自动杜绝 /tmp tmpfs 内存盘打满导致崩溃"""
+        env_dir = os.environ.get("VFIX_TEMP_DIR")
+        if env_dir:
+            p = Path(env_dir).expanduser().resolve()
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                if os.access(p, os.W_OK):
+                    return p
+            except Exception:
+                pass
+
+        vfix_tmp = Path.home() / ".vfix" / "tmp"
+        var_tmp = Path("/var/tmp")
+        sys_tmp = Path(tempfile.gettempdir())
+
+        candidates = []
+        for c in [vfix_tmp, var_tmp, sys_tmp]:
+            try:
+                c.mkdir(parents=True, exist_ok=True)
+                if os.access(c, os.W_OK):
+                    usage = shutil.disk_usage(c)
+                    candidates.append((c, usage.free))
+            except Exception:
+                continue
+
+        if not candidates:
+            fallback = Path(tempfile.gettempdir())
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        # 优先选择可用空间最大的目录 (如 ~/.vfix/tmp 或 /var/tmp)
+        best_dir, max_free = candidates[0]
+        return best_dir
+
+
+atexit.register(TempFileManager.cleanup_active)
+
+
+def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
+    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes，
+    并自动注册到 TempFileManager 进行生命周期跟踪与回收兜底。
+    """
+    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    path = temp_dir / f"{prefix}{safe_stem}{suffix}"
+    TempFileManager.register(path)
+    return path
 
 
 def derive_backup_source_path(file_path: Path) -> Path:
@@ -1069,16 +1285,19 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
     # 1. 同一文件系统尝试原子替换 (毫秒级)
     try:
         os.replace(src, dst)
+        TempFileManager.unregister(src)
         return
     except OSError as e:
         if e.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENXIO, errno.ENOTSUP, errno.EBADF):
             if src.resolve() == dst.resolve():
+                TempFileManager.unregister(src)
                 return
             raise
 
     # 2. 跨设备/网络挂载点安全流式分块传输与重试
     src_size = src.stat().st_size
     temp_dst = dst.with_name(f".{dst.name}.vfix_tmp.{os.getpid()}")
+    TempFileManager.register(temp_dst)
     chunk_size = 16 * 1024 * 1024  # 16 MB 缓冲区
 
     TRANSIENT_ERRNOS = {
@@ -1101,7 +1320,7 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
             # 确保目标目录可用
             dst.parent.mkdir(parents=True, exist_ok=True)
             if temp_dst.exists():
-                temp_dst.unlink(missing_ok=True)
+                TempFileManager.safe_unlink(temp_dst)
 
             with open(src, "rb") as fsrc, open(temp_dst, "wb") as fdst:
                 while True:
@@ -1134,17 +1353,16 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
                 else:
                     raise replace_err
 
-            # 5. 校验完成，删除源临时文件
+            # 5. 校验完成，删除源临时文件并注销跟踪
             src.unlink(missing_ok=True)
+            TempFileManager.unregister(src)
+            TempFileManager.unregister(temp_dst)
             return
 
         except OSError as e:
             last_error = e
             if temp_dst.exists():
-                try:
-                    temp_dst.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                TempFileManager.safe_unlink(temp_dst)
 
             is_transient = e.errno in TRANSIENT_ERRNOS or "Bad file descriptor" in str(e)
             if is_transient and attempt < max_retries:
@@ -1653,9 +1871,11 @@ def detect_h264_sps_pps_for_idr(idr_data: bytes, sei_data: Optional[bytes] = Non
     ]
 
     START = b"\x00\x00\x00\x01"
-    temp_dir = Path(tempfile.gettempdir())
+    temp_dir = TempFileManager.get_optimal_temp_dir()
     probe_gen = temp_dir / f"_vfix_probe_gen_{os.getpid()}.h264"
     probe_test = temp_dir / f"_vfix_probe_test_{os.getpid()}.h264"
+    TempFileManager.register(probe_gen)
+    TempFileManager.register(probe_test)
 
     try:
         for w, h in candidates:
@@ -1687,11 +1907,7 @@ def detect_h264_sps_pps_for_idr(idr_data: bytes, sei_data: Optional[bytes] = Non
                 return w, h, (START + sps_nal + START + pps_nal)
     finally:
         for p in (probe_gen, probe_test):
-            if p.exists():
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            TempFileManager.safe_unlink(p)
 
     return None, None, None
 
@@ -1836,9 +2052,11 @@ def _salvage_corrupted_mp4_stco(file_path: Path, output_file: Path) -> bool:
         events.extend([(off, "A", sz) for off, sz in valid_a])
         events.sort(key=lambda x: x[0])
 
-        temp_dir = Path(tempfile.gettempdir())
+        temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=file_size)
         temp_v = temp_dir / f"_vfix_stream_{os.getpid()}.h264"
         temp_a = temp_dir / f"_vfix_stream_{os.getpid()}.aac"
+        TempFileManager.register(temp_v)
+        TempFileManager.register(temp_a)
 
         START_CODE = b"\x00\x00\x00\x01"
         freq_map = {96000:0, 88200:1, 64000:2, 48000:3, 44100:4, 32000:5, 24000:6, 22050:7, 16000:8, 12000:9, 11025:10, 8000:11}
@@ -1898,11 +2116,7 @@ def _salvage_corrupted_mp4_stco(file_path: Path, output_file: Path) -> bool:
             return r.returncode == 0 and output_file.exists() and output_file.stat().st_size > 1024
         finally:
             for p in (temp_v, temp_a):
-                if p.exists():
-                    try:
-                        p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                TempFileManager.safe_unlink(p)
 
 
 def salvage_with_untrunc(file_path: Path, output_file: Path) -> bool:
@@ -1948,50 +2162,52 @@ def salvage_with_untrunc(file_path: Path, output_file: Path) -> bool:
         return -score
 
     candidates.sort(key=candidate_score)
-    temp_dir = Path(tempfile.gettempdir())
+    temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=file_path.stat().st_size if file_path.exists() else 0)
 
     best_candidate_file = None
     best_err_len = 999999999
 
-    for ref in candidates[:8]:
-        temp_fixed = temp_dir / f"untrunc_salvage_{os.getpid()}_{ref.stem[:12]}.mp4"
-        cmd = [str(untrunc_bin), "-dst", str(temp_fixed), str(ref), str(file_path)]
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=180)
-            if temp_fixed.exists() and temp_fixed.stat().st_size > 1024:
-                # 校验视频是否能被完美解码（验证宏块与 SPS/PPS 分辨率是否精准对齐）
-                chk = subprocess.run(
-                    ["ffmpeg", "-v", "error", "-ss", "30", "-i", str(temp_fixed), "-vframes", "5", "-f", "null", "-"],
-                    capture_output=True, text=True, timeout=20
-                )
-                err_len = len(chk.stderr.strip())
-                if chk.returncode == 0 and err_len == 0:
-                    if best_candidate_file and best_candidate_file.exists():
-                        best_candidate_file.unlink(missing_ok=True)
-                    shutil.move(str(temp_fixed), str(output_file))
-                    print(f"  * [残缺救砖] 成功利用完美同构参考视频 ({ref.name}) 通过 untrunc 成功重建完整 moov 索引与音视频轨！")
-                    return True
-                elif chk.returncode == 0 and err_len < best_err_len:
-                    if best_candidate_file and best_candidate_file.exists():
-                        best_candidate_file.unlink(missing_ok=True)
-                    best_candidate_file = temp_fixed
-                    best_err_len = err_len
-                    continue
-        except Exception:
-            pass
-
-        if temp_fixed.exists() and temp_fixed != best_candidate_file:
+    try:
+        for ref in candidates[:8]:
+            temp_fixed = temp_dir / f"untrunc_salvage_{os.getpid()}_{ref.stem[:12]}.mp4"
+            TempFileManager.register(temp_fixed)
+            cmd = [str(untrunc_bin), "-dst", str(temp_fixed), str(ref), str(file_path)]
             try:
-                temp_fixed.unlink(missing_ok=True)
+                r = subprocess.run(cmd, capture_output=True, timeout=180)
+                if temp_fixed.exists() and temp_fixed.stat().st_size > 1024:
+                    # 校验视频是否能被完美解码（验证宏块与 SPS/PPS 分辨率是否精准对齐）
+                    chk = subprocess.run(
+                        ["ffmpeg", "-v", "error", "-ss", "30", "-i", str(temp_fixed), "-vframes", "5", "-f", "null", "-"],
+                        capture_output=True, text=True, timeout=20
+                    )
+                    err_len = len(chk.stderr.strip())
+                    if chk.returncode == 0 and err_len == 0:
+                        if best_candidate_file and best_candidate_file.exists():
+                            TempFileManager.safe_unlink(best_candidate_file)
+                        safe_move_file(temp_fixed, output_file)
+                        print(f"  * [残缺救砖] 成功利用完美同构参考视频 ({ref.name}) 通过 untrunc 成功重建完整 moov 索引与音视频轨！")
+                        return True
+                    elif chk.returncode == 0 and err_len < best_err_len:
+                        if best_candidate_file and best_candidate_file.exists():
+                            TempFileManager.safe_unlink(best_candidate_file)
+                        best_candidate_file = temp_fixed
+                        best_err_len = err_len
+                        continue
             except Exception:
                 pass
 
-    if best_candidate_file and best_candidate_file.exists():
-        shutil.move(str(best_candidate_file), str(output_file))
-        print(f"  * [残缺救砖] 采用次优同构参考视频重建 moov 索引 (残存微小解码偏差)！")
-        return True
+            if temp_fixed.exists() and temp_fixed != best_candidate_file:
+                TempFileManager.safe_unlink(temp_fixed)
 
-    return False
+        if best_candidate_file and best_candidate_file.exists():
+            safe_move_file(best_candidate_file, output_file)
+            print(f"  * [残缺救砖] 采用次优同构参考视频重建 moov 索引 (残存微小解码偏差)！")
+            return True
+
+        return False
+    finally:
+        if best_candidate_file and best_candidate_file.exists() and best_candidate_file != output_file:
+            TempFileManager.safe_unlink(best_candidate_file)
 
 
 def salvage_corrupted_mp4(file_path: Path, output_file: Path) -> bool:
@@ -2305,7 +2521,7 @@ CURRENT_ACTIVE_PROCESS: Optional[subprocess.Popen] = None
 
 
 def setup_signal_handlers():
-    """注册进程信号处理，确保被 SIGTERM/SIGHUP 终止时妥善清理子进程 FFmpeg"""
+    """注册进程信号处理，确保被 SIGINT/SIGTERM/SIGHUP 终止时妥善清理子进程 FFmpeg 及中间临时文件，杜绝磁盘打满"""
     def handle_termination(signum, frame):
         global CURRENT_ACTIVE_PROCESS
         if CURRENT_ACTIVE_PROCESS:
@@ -2317,9 +2533,14 @@ def setup_signal_handlers():
                     CURRENT_ACTIVE_PROCESS.kill()
                 except Exception:
                     pass
-        sys.exit(143)
+        cleaned = TempFileManager.cleanup_active()
+        if cleaned > 0:
+            sys.stderr.write(f"\n[清理] 已安全回收中断产生的 {cleaned} 个临时缓存文件。\n")
+        exit_code = 130 if signum == signal.SIGINT else 143
+        sys.exit(exit_code)
 
     try:
+        signal.signal(signal.SIGINT, handle_termination)
         signal.signal(signal.SIGTERM, handle_termination)
         signal.signal(signal.SIGHUP, handle_termination)
     except Exception:
@@ -2448,7 +2669,7 @@ def execute_ffmpeg(
             return False, err_msg
         return True, ""
     except KeyboardInterrupt:
-        sys.stdout.write("\n  [中断] 接收到中断信号，正在终止 FFmpeg 进程...\n")
+        sys.stdout.write("\n  [中断] 接收到中断信号，正在终止 FFmpeg 进程并清理临时文件...\n")
         sys.stdout.flush()
         try:
             proc.terminate()
@@ -2458,6 +2679,7 @@ def execute_ffmpeg(
                 proc.kill()
             except Exception:
                 pass
+        TempFileManager.cleanup_active()
         raise
     except Exception as e:
         return False, str(e)
@@ -2588,6 +2810,37 @@ def remove_source_files(
             print(f"  * [警告] 删除源文件失败 ({s.resolve()}): {e}", file=sys.stderr)
 
 
+def _handle_subtitles_extraction(
+    target_file: Path,
+    enabled: bool,
+    model: str = "large-v3-turbo",
+    lang: Optional[str] = None,
+    formats: Optional[List[str]] = None,
+    embed: bool = False
+) -> None:
+    """级联调用配套的 video_subtitles 模块为产物提取字幕"""
+    if not enabled:
+        return
+    if extract_subtitles_for_file is None:
+        print("  [提示] 未找到配套的 video_subtitles 模块，无法执行字幕提取，跳过...")
+        return
+    print(f"  * [智能字幕] 正在为产物提取字幕: {target_file.name} ...")
+    sub_res = extract_subtitles_for_file(
+        video_path=target_file,
+        model=model,
+        language=lang,
+        formats=formats or ["srt"],
+        embed=embed
+    )
+    if sub_res.get("status") == "SUCCESS":
+        f_list = [f.name for f in sub_res.get("files", {}).values()]
+        print(f"  * [智能字幕] 提取成功! 语言: [{sub_res.get('language')}], 生成: {', '.join(f_list)} (耗时: {sub_res.get('elapsed_sec', 0):.1f}s)")
+        if sub_res.get("embedded"):
+            print(f"  * [智能字幕] 已成功软混流进视频容器。")
+    else:
+        print(f"  [智能字幕警告] 提取字幕失败: {sub_res.get('error', '未知错误')}")
+
+
 def process_video(
     file_path: Path,
     output_dir: Optional[Path],
@@ -2609,7 +2862,12 @@ def process_video(
     keep_name: bool = False,
     ss: Optional[str] = None,
     to: Optional[str] = None,
-    duration_limit: Optional[str] = None
+    duration_limit: Optional[str] = None,
+    subtitles: bool = False,
+    subtitle_model: str = "large-v3-turbo",
+    subtitle_lang: Optional[str] = None,
+    subtitle_format: Optional[List[str]] = None,
+    subtitle_embed: bool = False
 ) -> bool:
     """处理单个视频文件（支持深度容错修复、片段剪切、智能去黑边、硬件极速压缩与本地 SSD 缓冲写入）。"""
     print("=" * 70)
@@ -2624,10 +2882,10 @@ def process_video(
         )
 
     salvaged_src_file: Optional[Path] = None
+    temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=file_path.stat().st_size if file_path.exists() else 0)
     info = probe_video(file_path)
     if not info or not info.get("width"):
         print(f"  * [残缺救砖] 检测到容器头或索引严重损毁（常规解复用失败），启动 MP4/MOV 底层原子流提取抢救引擎...")
-        temp_dir = Path(tempfile.gettempdir())
         clean_stem = get_clean_stem(file_path)
         salvaged_candidate = make_safe_temp_path(temp_dir, f"vfix_salvaged_{os.getpid()}_", clean_stem, suffix=".mp4", max_total_bytes=240)
         if salvage_corrupted_mp4(file_path, salvaged_candidate):
@@ -2979,7 +3237,8 @@ def process_video(
     # 使用本地 SSD /tmp 目录作为临时输出缓冲：
     # 彻底杜绝 SMB 局域网网络盘在 -movflags +faststart 时产生的高延迟与 I/O 卡死
     # 严格采用 make_safe_temp_path 保证临时文件名绝不超过 Linux/SMB 255 字节限制
-    temp_dir = Path(tempfile.gettempdir())
+    # 自动挑选可用空间最大的非 tmpfs 分区 (如 ~/.vfix/tmp 或 /var/tmp)，杜绝磁盘爆满
+    temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=orig_size)
     temp_output_file = make_safe_temp_path(
         temp_dir=temp_dir,
         prefix=f"vrc_{os.getpid()}_",
@@ -3321,7 +3580,7 @@ def process_video(
 
         if not success and not salvaged_src_file and any(k in (last_err_msg or "").lower() for k in ["invalid data found", "moov atom not found", "error opening input"]):
             print("  * [残缺救砖] 捕获到解复用器致命错误，自动启动 MP4/MOV 底层原子流提取抢救引擎...")
-            temp_dir = Path(tempfile.gettempdir())
+            temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=orig_size)
             clean_stem = get_clean_stem(file_path)
             salvaged_candidate = make_safe_temp_path(temp_dir, f"vfix_salvaged_{os.getpid()}_", clean_stem, suffix=".mp4", max_total_bytes=240)
             if salvage_corrupted_mp4(file_path, salvaged_candidate):
@@ -3456,6 +3715,17 @@ def process_video(
                     details=f"{reason}{detail_suffix}",
                     tool="vfix"
                 )
+
+            # 智能提取字幕 (若启用了 -S / --subtitles)
+            _handle_subtitles_extraction(
+                target_file=final_output_file,
+                enabled=subtitles,
+                model=subtitle_model,
+                lang=subtitle_lang,
+                formats=subtitle_format,
+                embed=subtitle_embed
+            )
+
             if delete_source and not keep_name:
                 remove_source_files([file_path], final_output_file, reason="转码压缩成功后安全清理源文件 (--delete-source)")
             return True
@@ -3482,6 +3752,7 @@ def process_video(
         safe_path_unlink(temp_output_file)
         safe_path_unlink(salvaged_audio_file)
         safe_path_unlink(salvaged_src_file)
+        TempFileManager.cleanup_stale_temp_files(custom_dirs=[temp_dir])
 
 
 
@@ -3501,7 +3772,12 @@ def process_merged_videos(
     keep_name: bool = False,
     ss: Optional[str] = None,
     to: Optional[str] = None,
-    duration_limit: Optional[str] = None
+    duration_limit: Optional[str] = None,
+    subtitles: bool = False,
+    subtitle_model: str = "large-v3-turbo",
+    subtitle_lang: Optional[str] = None,
+    subtitle_format: Optional[List[str]] = None,
+    subtitle_embed: bool = False
 ) -> bool:
     """多分卷视频智能对齐合并与硬件/软件容错编码压缩 (支持极速无损流复制合并与 Filter Concat Pipeline)。"""
     is_merge_only = merge_only or force_repair_only
@@ -3581,305 +3857,445 @@ def process_merged_videos(
         max_h = max(max_h, info.get("height", 0))
         max_fps = max(max_fps, info.get("fps", 0.0))
 
-    temp_dir = Path(tempfile.gettempdir())
+    temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=total_orig_size)
     salvaged_audio_files: List[Optional[Path]] = []
     audio_modes: List[str] = []
     has_any_audio = False
     concat_list_file: Optional[Path] = None
+    temp_output_file: Optional[Path] = None
 
-    # 预检并抢救所有分卷的音频轨道
-    for idx, f in enumerate(file_paths):
-        p_info = probes[idx]
-        mode = preflight_audio(f, p_info)
-        salvaged_file = None
-        if mode == "vorbis_acm":
-            clean_stem = get_clean_stem(f)
-            temp_salvage = make_safe_temp_path(
-                temp_dir, f"vrc_merge_salvage_{os.getpid()}_{idx}_", clean_stem, suffix=".aac", max_total_bytes=240
-            )
-            print(f"  * 分卷 [{idx+1}/{n_files}] 检测到 AVI 特殊音频封装 (Vorbis ACM / 0x6771)，正在清洗提取并转码为 AAC...")
-            t_s = time.time()
-            if extract_vorbis_acm_audio(f, temp_salvage, 128):
-                print(f"    -> 分卷 [{idx+1}/{n_files}] 音频抢救成功 (耗时: {time.time()-t_s:.1f}s, 大小: {format_bytes(temp_salvage.stat().st_size)})")
-                salvaged_file = temp_salvage
-                mode = "vorbis_acm"
+    try:
+        # 预检并抢救所有分卷的音频轨道
+        for idx, f in enumerate(file_paths):
+            p_info = probes[idx]
+            mode = preflight_audio(f, p_info)
+            salvaged_file = None
+            if mode == "vorbis_acm":
+                clean_stem = get_clean_stem(f)
+                temp_salvage = make_safe_temp_path(
+                    temp_dir, f"vrc_merge_salvage_{os.getpid()}_{idx}_", clean_stem, suffix=".aac", max_total_bytes=240
+                )
+                print(f"  * 分卷 [{idx+1}/{n_files}] 检测到 AVI 特殊音频封装 (Vorbis ACM / 0x6771)，正在清洗提取并转码为 AAC...")
+                t_s = time.time()
+                if extract_vorbis_acm_audio(f, temp_salvage, 128):
+                    print(f"    -> 分卷 [{idx+1}/{n_files}] 音频抢救成功 (耗时: {time.time()-t_s:.1f}s, 大小: {format_bytes(temp_salvage.stat().st_size)})")
+                    salvaged_file = temp_salvage
+                    mode = "vorbis_acm"
+                else:
+                    print(f"    [警告] 分卷 [{idx+1}/{n_files}] Vorbis ACM 音频损坏无法抢救，将填充静音轨道确保对齐")
+                    mode = "none"
+            elif mode == "none" and p_info.get("has_audio", False):
+                print(f"  * [提示] 分卷 [{idx+1}/{n_files}] 音频流损坏或缺少可用解码器，将自动填充静音轨道")
+
+            audio_modes.append(mode)
+            salvaged_audio_files.append(salvaged_file)
+            if mode != "none":
+                has_any_audio = True
+
+        for idx, p in enumerate(probes):
+            if audio_modes[idx] != "none" and p.get("audio_bitrate", 0.0) > 0:
+                audio_bitrates.append(p["audio_bitrate"])
+
+        # 规范化分辨率（确保偶数尺寸以满足 yuv420p 要求）
+        if max_w <= 0:
+            max_w = 1280
+        if max_h <= 0:
+            max_h = 720
+        if max_w % 2 != 0:
+            max_w += 1
+        if max_h % 2 != 0:
+            max_h += 1
+        if max_fps <= 0.0:
+            max_fps = 30.0
+        target_fps = round(max_fps, 2)
+
+        synth_info = {"width": max_w, "height": max_h, "fps": target_fps}
+        expected_bps = get_expected_bitrate(synth_info, crf, encoder)
+
+        # 计算原视频分卷的平均视频净码率
+        valid_v_bitrates = [
+            p.get("video_bitrate", p.get("bitrate", 0.0))
+            for p in probes if p.get("video_bitrate", p.get("bitrate", 0.0)) > 0
+        ]
+        if valid_v_bitrates:
+            avg_v_bps = sum(valid_v_bitrates) / len(valid_v_bitrates)
+        else:
+            avg_v_bps = 0.0
+
+        codecs_set = {p.get("codec", "").lower() for p in probes if p}
+        has_legacy = any(c in LEGACY_INEFFICIENT_CODECS for c in codecs_set)
+
+        if is_merge_only:
+            target_bps = int(avg_v_bps * 1.05) if avg_v_bps > 0 else expected_bps
+            merge_crf = min(crf, 19)
+        else:
+            if avg_v_bps > 0 and not has_legacy:
+                target_bps = min(expected_bps, int(avg_v_bps * 0.85))
+                if expected_bps > avg_v_bps:
+                    print(f"  * 码率保护策略: 基准推算码率 ({format_bitrate(expected_bps)}) 高于分卷平均视频码率 ({format_bitrate(avg_v_bps)})，"
+                          f"自动降级封顶至 ~{format_bitrate(target_bps)} (严禁高于源分卷，杜绝反向膨胀)")
             else:
-                print(f"    [警告] 分卷 [{idx+1}/{n_files}] Vorbis ACM 音频损坏无法抢救，将填充静音轨道确保对齐")
-                mode = "none"
-        elif mode == "none" and p_info.get("has_audio", False):
-            print(f"  * [提示] 分卷 [{idx+1}/{n_files}] 音频流损坏或缺少可用解码器，将自动填充静音轨道")
+                target_bps = expected_bps
+            merge_crf = crf
 
-        audio_modes.append(mode)
-        salvaged_audio_files.append(salvaged_file)
-        if mode != "none":
-            has_any_audio = True
+        is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
+        is_arm_arch = platform.machine().lower() in ("arm64", "aarch64")
+        if is_hardware and not is_arm_arch and (max_w < 640 or max_h < 360):
+            fallback_cpu = "libx265" if "hevc" in encoder else "libx264"
+            if not is_merge_only:
+                print(f"  * 提示: 目标分辨率 ({max_w}x{max_h}) 偏小且处于 x86_64 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
+            encoder = fallback_cpu
+            is_hardware = False
 
-    for idx, p in enumerate(probes):
-        if audio_modes[idx] != "none" and p.get("audio_bitrate", 0.0) > 0:
-            audio_bitrates.append(p["audio_bitrate"])
-
-    # 规范化分辨率（确保偶数尺寸以满足 yuv420p 要求）
-    if max_w <= 0:
-        max_w = 1280
-    if max_h <= 0:
-        max_h = 720
-    if max_w % 2 != 0:
-        max_w += 1
-    if max_h % 2 != 0:
-        max_h += 1
-    if max_fps <= 0.0:
-        max_fps = 30.0
-    target_fps = round(max_fps, 2)
-
-    synth_info = {"width": max_w, "height": max_h, "fps": target_fps}
-    expected_bps = get_expected_bitrate(synth_info, crf, encoder)
-
-    # 计算原视频分卷的平均视频净码率
-    valid_v_bitrates = [
-        p.get("video_bitrate", p.get("bitrate", 0.0))
-        for p in probes if p.get("video_bitrate", p.get("bitrate", 0.0)) > 0
-    ]
-    if valid_v_bitrates:
-        avg_v_bps = sum(valid_v_bitrates) / len(valid_v_bitrates)
-    else:
-        avg_v_bps = 0.0
-
-    codecs_set = {p.get("codec", "").lower() for p in probes if p}
-    has_legacy = any(c in LEGACY_INEFFICIENT_CODECS for c in codecs_set)
-
-    if is_merge_only:
-        target_bps = int(avg_v_bps * 1.05) if avg_v_bps > 0 else expected_bps
-        merge_crf = min(crf, 19)
-    else:
-        if avg_v_bps > 0 and not has_legacy:
-            target_bps = min(expected_bps, int(avg_v_bps * 0.85))
-            if expected_bps > avg_v_bps:
-                print(f"  * 码率保护策略: 基准推算码率 ({format_bitrate(expected_bps)}) 高于分卷平均视频码率 ({format_bitrate(avg_v_bps)})，"
-                      f"自动降级封顶至 ~{format_bitrate(target_bps)} (严禁高于源分卷，杜绝反向膨胀)")
+        # 确定最终输出格式与路径
+        all_mp4_compliant = all(
+            p.get("codec", "").lower() in MP4_COMPLIANT_VIDEO_CODECS for p in probes if p
+        )
+        if is_merge_only:
+            if all_mp4_compliant:
+                target_ext = ".mp4"
+            elif len(input_exts) == 1 and list(input_exts)[0] in BASE_VIDEO_EXTENSIONS:
+                target_ext = list(input_exts)[0]
+            else:
+                target_ext = ".mkv"
         else:
-            target_bps = expected_bps
-        merge_crf = crf
-
-    is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
-    is_arm_arch = platform.machine().lower() in ("arm64", "aarch64")
-    if is_hardware and not is_arm_arch and (max_w < 640 or max_h < 360):
-        fallback_cpu = "libx265" if "hevc" in encoder else "libx264"
-        if not is_merge_only:
-            print(f"  * 提示: 目标分辨率 ({max_w}x{max_h}) 偏小且处于 x86_64 架构，自动选用 CPU 软件极速编码 ({fallback_cpu})")
-        encoder = fallback_cpu
-        is_hardware = False
-
-    # 确定最终输出格式与路径
-    all_mp4_compliant = all(
-        p.get("codec", "").lower() in MP4_COMPLIANT_VIDEO_CODECS for p in probes if p
-    )
-    if is_merge_only:
-        if all_mp4_compliant:
             target_ext = ".mp4"
-        elif len(input_exts) == 1 and list(input_exts)[0] in BASE_VIDEO_EXTENSIONS:
-            target_ext = list(input_exts)[0]
+
+        # === 视频剪切参数解析与安全校验 ===
+        has_trim = bool(ss or to or duration_limit)
+        total_orig_duration = sum(p.get("duration", 0.0) for p in probes)
+        start_sec = 0.0
+        end_sec = total_orig_duration
+
+        if has_trim:
+            if ss:
+                try:
+                    parsed_ss = parse_time_offset(ss)
+                except ValueError as e:
+                    print(f"\n  [错误] 剪切起始参数 --ss 格式非法: {e}", file=sys.stderr)
+                    return False
+                start_sec = max(0.0, total_orig_duration + parsed_ss) if parsed_ss < 0 and total_orig_duration > 0 else (parsed_ss if parsed_ss >= 0 else 0.0)
+            if to:
+                try:
+                    parsed_to = parse_time_offset(to)
+                except ValueError as e:
+                    print(f"\n  [错误] 剪切截止参数 --to 格式非法: {e}", file=sys.stderr)
+                    return False
+                end_sec = total_orig_duration + parsed_to if parsed_to < 0 and total_orig_duration > 0 else (parsed_to if parsed_to >= 0 else total_orig_duration)
+            elif duration_limit:
+                try:
+                    parsed_dur = parse_time_offset(duration_limit)
+                except ValueError as e:
+                    print(f"\n  [错误] 剪切持续时长参数 -t / --duration 格式非法: {e}", file=sys.stderr)
+                    return False
+                end_sec = start_sec + parsed_dur
+
+            if total_orig_duration > 0 and start_sec >= total_orig_duration:
+                err_msg = f"剪切起始时间 ({format_time_str(start_sec)}) 超过总时长 ({format_time_str(total_orig_duration)})"
+                print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_OUT_OF_BOUNDS", orig_size=total_orig_size, tool="vfix")
+                return False
+            if end_sec <= start_sec:
+                err_msg = f"剪切截止时间 ({format_time_str(end_sec)}) 小于或等于起始时间 ({format_time_str(start_sec)})"
+                print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
+                if vlog:
+                    vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_EMPTY_RANGE", orig_size=total_orig_size, tool="vfix")
+                return False
+            if total_orig_duration > 0 and end_sec > total_orig_duration:
+                end_sec = total_orig_duration
+            target_merged_dur = max(0.1, end_sec - start_sec)
+            cut_intro = start_sec
+            cut_outro = max(0.0, total_orig_duration - end_sec) if total_orig_duration > 0 else 0.0
+            print(f"  * 合并剪切配置: 起点: {format_time_str(start_sec)} | 终点: {format_time_str(end_sec)} | 目标片段时长: {format_time_str(target_merged_dur)} (去除: 开头 {format_time_str(cut_intro)}, 结尾 {format_time_str(cut_outro)})")
         else:
-            target_ext = ".mkv"
-    else:
-        target_ext = ".mp4"
+            target_merged_dur = total_orig_duration
 
-    # === 视频剪切参数解析与安全校验 ===
-    has_trim = bool(ss or to or duration_limit)
-    total_orig_duration = sum(p.get("duration", 0.0) for p in probes)
-    start_sec = 0.0
-    end_sec = total_orig_duration
+        concat_seek_args = []
+        if has_trim:
+            if start_sec > 0:
+                concat_seek_args.extend(["-ss", f"{start_sec:.3f}"])
+            if total_orig_duration > 0 and end_sec < total_orig_duration:
+                concat_seek_args.extend(["-to", f"{end_sec:.3f}"])
 
-    if has_trim:
-        if ss:
-            try:
-                parsed_ss = parse_time_offset(ss)
-            except ValueError as e:
-                print(f"\n  [错误] 剪切起始参数 --ss 格式非法: {e}", file=sys.stderr)
-                return False
-            start_sec = max(0.0, total_orig_duration + parsed_ss) if parsed_ss < 0 and total_orig_duration > 0 else (parsed_ss if parsed_ss >= 0 else 0.0)
-        if to:
-            try:
-                parsed_to = parse_time_offset(to)
-            except ValueError as e:
-                print(f"\n  [错误] 剪切截止参数 --to 格式非法: {e}", file=sys.stderr)
-                return False
-            end_sec = total_orig_duration + parsed_to if parsed_to < 0 and total_orig_duration > 0 else (parsed_to if parsed_to >= 0 else total_orig_duration)
-        elif duration_limit:
-            try:
-                parsed_dur = parse_time_offset(duration_limit)
-            except ValueError as e:
-                print(f"\n  [错误] 剪切持续时长参数 -t / --duration 格式非法: {e}", file=sys.stderr)
-                return False
-            end_sec = start_sec + parsed_dur
+        final_output_file = derive_merged_output_path(
+            file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name, is_cut=has_trim
+        )
+        final_output_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_output_file = make_safe_temp_path(
+            temp_dir, f"vrc_merge_{os.getpid()}_", get_clean_stem(final_output_file), suffix=final_output_file.suffix, max_total_bytes=240
+        )
 
-        if total_orig_duration > 0 and start_sec >= total_orig_duration:
-            err_msg = f"剪切起始时间 ({format_time_str(start_sec)}) 超过总时长 ({format_time_str(total_orig_duration)})"
-            print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
-            if vlog:
-                vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_OUT_OF_BOUNDS", orig_size=total_orig_size, tool="vfix")
-            return False
-        if end_sec <= start_sec:
-            err_msg = f"剪切截止时间 ({format_time_str(end_sec)}) 小于或等于起始时间 ({format_time_str(start_sec)})"
-            print(f"\n  [安全熔断] {err_msg}，跳过合并", file=sys.stderr)
-            if vlog:
-                vlog.log_failed(file_paths, error_msg=err_msg, action="MERGE_TRIM_EMPTY_RANGE", orig_size=total_orig_size, tool="vfix")
-            return False
-        if total_orig_duration > 0 and end_sec > total_orig_duration:
-            end_sec = total_orig_duration
-        target_merged_dur = max(0.1, end_sec - start_sec)
-        cut_intro = start_sec
-        cut_outro = max(0.0, total_orig_duration - end_sec) if total_orig_duration > 0 else 0.0
-        print(f"  * 合并剪切配置: 起点: {format_time_str(start_sec)} | 终点: {format_time_str(end_sec)} | 目标片段时长: {format_time_str(target_merged_dur)} (去除: 开头 {format_time_str(cut_intro)}, 结尾 {format_time_str(cut_outro)})")
-    else:
-        target_merged_dur = total_orig_duration
-
-    concat_seek_args = []
-    if has_trim:
-        if start_sec > 0:
-            concat_seek_args.extend(["-ss", f"{start_sec:.3f}"])
-        if total_orig_duration > 0 and end_sec < total_orig_duration:
-            concat_seek_args.extend(["-to", f"{end_sec:.3f}"])
-
-    final_output_file = derive_merged_output_path(
-        file_paths, output_target, is_compressed=not is_merge_only, default_ext=target_ext, keep_name=keep_name, is_cut=has_trim
-    )
-    final_output_file.parent.mkdir(parents=True, exist_ok=True)
-    temp_output_file = make_safe_temp_path(
-        temp_dir, f"vrc_merge_{os.getpid()}_", get_clean_stem(final_output_file), suffix=final_output_file.suffix, max_total_bytes=240
-    )
-
-    if audio_bitrates:
-        avg_a_bps = sum(audio_bitrates) / len(audio_bitrates)
-        orig_a_kbps = max(32, int(avg_a_bps / 1000))
-        target_audio_kbps = min(128, orig_a_kbps)
-    else:
-        if avg_v_bps > 0:
-            target_audio_kbps = min(96, max(32, int(avg_v_bps * 0.15 / 1000)))
+        if audio_bitrates:
+            avg_a_bps = sum(audio_bitrates) / len(audio_bitrates)
+            orig_a_kbps = max(32, int(avg_a_bps / 1000))
+            target_audio_kbps = min(128, orig_a_kbps)
         else:
-            target_audio_kbps = 96
+            if avg_v_bps > 0:
+                target_audio_kbps = min(96, max(32, int(avg_v_bps * 0.15 / 1000)))
+            else:
+                target_audio_kbps = 96
 
-    # ========================================================
-    # 编码与拼接参数预处理
-    # ========================================================
-    # 关键帧间隔优化：保证每 1~2 秒至少一个关键帧，确保在 IINA / QuickTime 中拖动进度条丝滑顺畅
-    merge_gop = max(15, int(target_fps * 2))
-    merge_keyint_min = max(15, int(target_fps))
+        # ========================================================
+        # 编码与拼接参数预处理
+        # ========================================================
+        # 关键帧间隔优化：保证每 1~2 秒至少一个关键帧，确保在 IINA / QuickTime 中拖动进度条丝滑顺畅
+        merge_gop = max(15, int(target_fps * 2))
+        merge_keyint_min = max(15, int(target_fps))
 
-    # 预先生成视频编码参数（全面继承 B 帧、Profile、Spatial-AQ 与色彩保真标签）
-    video_encode_args = build_video_encode_args(
-        encoder=encoder,
-        target_bps=target_bps,
-        orig_v_bitrate=avg_v_bps,
-        crf=merge_crf,
-        preset=preset,
-        gop_size=merge_gop,
-        keyint_min=merge_keyint_min,
-        width=max_w,
-        height=max_h,
-        is_merge=True
-    )
-    sw_video_args = build_video_encode_args(
-        encoder="libx264",
-        target_bps=target_bps,
-        orig_v_bitrate=avg_v_bps,
-        crf=merge_crf,
-        preset=preset,
-        gop_size=merge_gop,
-        keyint_min=merge_keyint_min,
-        width=max_w,
-        height=max_h,
-        is_merge=True
-    )
+        # 预先生成视频编码参数（全面继承 B 帧、Profile、Spatial-AQ 与色彩保真标签）
+        video_encode_args = build_video_encode_args(
+            encoder=encoder,
+            target_bps=target_bps,
+            orig_v_bitrate=avg_v_bps,
+            crf=merge_crf,
+            preset=preset,
+            gop_size=merge_gop,
+            keyint_min=merge_keyint_min,
+            width=max_w,
+            height=max_h,
+            is_merge=True
+        )
+        sw_video_args = build_video_encode_args(
+            encoder="libx264",
+            target_bps=target_bps,
+            orig_v_bitrate=avg_v_bps,
+            crf=merge_crf,
+            preset=preset,
+            gop_size=merge_gop,
+            keyint_min=merge_keyint_min,
+            width=max_w,
+            height=max_h,
+            is_merge=True
+        )
 
-    same_v_codec = len({p.get("codec", "") for p in probes}) <= 1
-    resolutions = {(p.get("width", 0), p.get("height", 0)) for p in probes}
-    same_res = len(resolutions) <= 1
-    no_vorbis_acm = not any(m == "vorbis_acm" for m in audio_modes)
-    same_audio_status = all(p.get("has_audio", False) for p in probes) or not any(p.get("has_audio", False) for p in probes)
-    can_concat_demuxer = same_v_codec and same_res and no_vorbis_acm and same_audio_status
+        same_v_codec = len({p.get("codec", "") for p in probes}) <= 1
+        resolutions = {(p.get("width", 0), p.get("height", 0)) for p in probes}
+        same_res = len(resolutions) <= 1
+        no_vorbis_acm = not any(m == "vorbis_acm" for m in audio_modes)
+        same_audio_status = all(p.get("has_audio", False) for p in probes) or not any(p.get("has_audio", False) for p in probes)
+        can_concat_demuxer = same_v_codec and same_res and no_vorbis_acm and same_audio_status
 
-    # ========================================================
-    # 模式分支 1：基于 Concat Demuxer 的流式合并 (极速流复制或连续转码)
-    # 彻底解决多输入 filter_complex 在长视频下的 demuxer 缓冲区饥渴、帧丢弃与时间戳错位
-    # ========================================================
-    if can_concat_demuxer:
-        concat_list_file = temp_dir / f"vrc_concat_{os.getpid()}_{int(time.time() * 1000)}.txt"
-        try:
-            with open(concat_list_file, "w", encoding="utf-8") as f:
-                for fp in file_paths:
-                    escaped_path = fp.resolve().as_posix().replace("'", "'\\''")
-                    f.write(f"file '{escaped_path}'\n")
+        # ========================================================
+        # 模式分支 1：基于 Concat Demuxer 的流式合并 (极速流复制或连续转码)
+        # 彻底解决多输入 filter_complex 在长视频下的 demuxer 缓冲区饥渴、帧丢弃与时间戳错位
+        # ========================================================
+        if can_concat_demuxer:
+            concat_list_file = temp_dir / f"vrc_concat_{os.getpid()}_{int(time.time() * 1000)}.txt"
+            TempFileManager.register(concat_list_file)
+            try:
+                with open(concat_list_file, "w", encoding="utf-8") as f:
+                    for fp in file_paths:
+                        escaped_path = fp.resolve().as_posix().replace("'", "'\\''")
+                        f.write(f"file '{escaped_path}'\n")
 
-            # ----------------------------------------------------
-            # 策略 1A: 优先尝试极速无损流复制 (-c:v copy)
-            # 适用场景:
-            #   1) 单独合并模式 (is_merge_only)
-            #   2) 普通合并模式 (-m) 且分卷视频平均码率已处于或低于预期区间，免重复二次压缩
-            # ----------------------------------------------------
-            should_try_stream_copy = is_merge_only or (
-                not force_compress and not crop and avg_v_bps > 0 and avg_v_bps <= expected_bps
-            )
-            if should_try_stream_copy and (all_mp4_compliant or final_output_file.suffix.lower() != ".mp4"):
-                cmd_fast = [
-                    "ffmpeg", "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-max_error_rate", "1.0",
-                    "-err_detect", "ignore_err",
-                    "-fflags", "+discardcorrupt",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", str(concat_list_file)
-                ] + concat_seek_args + [
-                    "-c:v", "copy"
-                ]
+                # ----------------------------------------------------
+                # 策略 1A: 优先尝试极速无损流复制 (-c:v copy)
+                # 适用场景:
+                #   1) 单独合并模式 (is_merge_only)
+                #   2) 普通合并模式 (-m) 且分卷视频平均码率已处于或低于预期区间，免重复二次压缩
+                # ----------------------------------------------------
+                should_try_stream_copy = is_merge_only or (
+                    not force_compress and not crop and avg_v_bps > 0 and avg_v_bps <= expected_bps
+                )
+                if should_try_stream_copy and (all_mp4_compliant or final_output_file.suffix.lower() != ".mp4"):
+                    cmd_fast = [
+                        "ffmpeg", "-y",
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-max_error_rate", "1.0",
+                        "-err_detect", "ignore_err",
+                        "-fflags", "+discardcorrupt",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", str(concat_list_file)
+                    ] + concat_seek_args + [
+                        "-c:v", "copy"
+                    ]
 
-                audio_codecs = {p.get("audio_stream", {}).get("codec_name") for p in probes if p.get("audio_stream")}
+                    audio_codecs = {p.get("audio_stream", {}).get("codec_name") for p in probes if p.get("audio_stream")}
+                    if has_any_audio:
+                        if all(m == "copy" for m in audio_modes) and len(audio_codecs) <= 1:
+                            cmd_fast += ["-c:a", "copy"]
+                        else:
+                            cmd_fast += ["-c:a", "aac", "-b:a", f"{target_audio_kbps}k"]
+                    else:
+                        cmd_fast += ["-an"]
+
+                    cmd_fast += [
+                        "-avoid_negative_ts", "make_zero",
+                        "-max_muxing_queue_size", "4096"
+                    ]
+
+                    if final_output_file.suffix.lower() == ".mp4":
+                        cmd_fast += ["-movflags", "+faststart"]
+
+                    cmd_fast.append(str(temp_output_file))
+
+                    if has_trim:
+                        action_intro = "[分卷合并与剪切]"
+                    elif is_merge_only:
+                        action_intro = "[单独合并]"
+                    else:
+                        action_intro = "[分卷规整合并]"
+                    print(f"  * 策略决策: {action_intro} -> 启动极速无损流复制合并 (-c:v copy，跳过视频重编码)...")
+                    t_start = time.time()
+                    success_fast, fast_err = execute_ffmpeg(cmd_fast, duration=target_merged_dur)
+
+                    is_fast_truncated = False
+                    if success_fast and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+                        out_probe = probe_video(temp_output_file)
+                        if not out_probe or not out_probe.get("width"):
+                            success_fast = False
+                            fast_err = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
+                        else:
+                            out_dur = out_probe.get("duration", 0.0)
+                            if target_merged_dur > 15.0 and out_dur > 0.0:
+                                if out_dur < (target_merged_dur * 0.94) and (target_merged_dur - out_dur) > 4.0:
+                                    is_fast_truncated = True
+                                    fast_err = (
+                                        f"流复制剪切截断异常！预期时长: {target_merged_dur:.1f}s，"
+                                        f"产物仅: {out_dur:.1f}s"
+                                    )
+
+                    if success_fast and not is_fast_truncated and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+                        duration_sec = time.time() - t_start
+                        new_size = temp_output_file.stat().st_size
+                        size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
+
+                        safe_move_file(temp_output_file, final_output_file)
+
+                        if has_trim:
+                            done_label = "分卷合并与剪切成功"
+                        elif is_merge_only:
+                            done_label = "单独合并成功"
+                        else:
+                            done_label = "合并成功 (分卷码率已在合理区间，免二次压缩)"
+                        print(f"[完成] {done_label} (极速无损流复制)! 耗时: {duration_sec:.1f}s")
+                        print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
+                        print(f"  * 输出路径: {final_output_file}")
+                        if vlog:
+                            vlog.log_processed(
+                                input_file=file_paths,
+                                output_target=final_output_file,
+                                status="SUCCESS",
+                                action="MERGE_TRIM_STREAM_COPY" if has_trim else ("MERGE_ONLY" if is_merge_only else "MERGE_STREAM_COPY"),
+                                orig_size=total_orig_size,
+                                new_size=new_size,
+                                elapsed_sec=duration_sec,
+                                orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
+                                details=f"极速无损流复制合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
+                                tool="vfix"
+                            )
+                        _handle_subtitles_extraction(
+                            target_file=final_output_file,
+                            enabled=subtitles,
+                            model=subtitle_model,
+                            lang=subtitle_lang,
+                            formats=subtitle_format,
+                            embed=subtitle_embed
+                        )
+                        if keep_name and not delete_source:
+                            for fp in file_paths:
+                                orig_bak = derive_backup_source_path(fp)
+                                safe_move_file(fp, orig_bak)
+                                print(f"  * [分卷原文件已重命名备份]: {orig_bak.name}")
+                        elif delete_source:
+                            remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
+                        return True
+                    else:
+                        safe_path_unlink(temp_output_file)
+                        reason_snippet = fast_err.strip().splitlines()[-1] if fast_err.strip() else "时间戳/封装限制"
+                        print(f"  [提示] 无损流复制拼接未通过 ({reason_snippet})，自动平滑切换至 Concat Demuxer 高保真转码拼接...")
+
+                # ----------------------------------------------------
+                # 策略 1B: Concat Demuxer 顺序流式转码合并 (合并压缩或无损复制回退)
+                # ----------------------------------------------------
+                if not is_merge_only:
+                    print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
+                    if is_hardware:
+                        hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+                        print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
+                    else:
+                        print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
+                else:
+                    print(f"  * 规整拼接基准: {max_w}x{max_h} @ {target_fps}fps | 高保真保留画质 (Concat Demuxer)")
+                print(f"  * 目标输出路径: {final_output_file}")
+                if has_any_audio and audio_bitrates and target_audio_kbps < 128:
+                    orig_a_kbps = max(32, int((sum(audio_bitrates) / len(audio_bitrates)) / 1000))
+                    print(f"  * 音频码率策略: 分卷平均音频码率 ~{orig_a_kbps} kbps，合并音频转码限制为 {target_audio_kbps} kbps (不高于原始码率)")
+
+                merge_crop_filter = ""
+                if crop and detect_crop_box:
+                    m_crop_info = None
+                    if crop != "auto" and ":" in str(crop):
+                        parts = str(crop).strip().split(":")
+                        if len(parts) == 4:
+                            m_crop_info = {"crop_str": f"{parts[0]}:{parts[1]}:{parts[2]}:{parts[3]}"}
+                    else:
+                        m_crop_info = detect_crop_box(file_paths[0], max_w, max_h, probes[0].get("duration", 0.0), target_aspect=aspect)
+                    if m_crop_info and m_crop_info.get("has_black_bars", True):
+                        merge_crop_filter = f"crop={m_crop_info['crop_str']},"
+
+                if same_res:
+                    # 各分卷分辨率完全一致，跳过昂贵的 CPU 重缩放与填充滤镜，大幅提升吞吐效率
+                    vf_filter = f"{merge_crop_filter}fps={target_fps},setpts=PTS-STARTPTS"
+                else:
+                    vf_filter = (
+                        f"{merge_crop_filter}scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},setpts=PTS-STARTPTS"
+                    )
+                cmd_concat_transcode = (
+                    [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
+                        "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
+                        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+                        "-vf", vf_filter
+                    ]
+                    + concat_seek_args
+                )
                 if has_any_audio:
-                    if all(m == "copy" for m in audio_modes) and len(audio_codecs) <= 1:
-                        cmd_fast += ["-c:a", "copy"]
-                    else:
-                        cmd_fast += ["-c:a", "aac", "-b:a", f"{target_audio_kbps}k"]
+                    cmd_concat_transcode += [
+                        "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
+                        "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"
+                    ]
                 else:
-                    cmd_fast += ["-an"]
+                    cmd_concat_transcode += ["-an"]
 
-                cmd_fast += [
-                    "-avoid_negative_ts", "make_zero",
-                    "-max_muxing_queue_size", "4096"
-                ]
+                cmd_concat_transcode += (
+                    video_encode_args
+                    + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
+                )
 
-                if final_output_file.suffix.lower() == ".mp4":
-                    cmd_fast += ["-movflags", "+faststart"]
-
-                cmd_fast.append(str(temp_output_file))
-
-                if has_trim:
-                    action_intro = "[分卷合并与剪切]"
-                elif is_merge_only:
-                    action_intro = "[单独合并]"
-                else:
-                    action_intro = "[分卷规整合并]"
-                print(f"  * 策略决策: {action_intro} -> 启动极速无损流复制合并 (-c:v copy，跳过视频重编码)...")
                 t_start = time.time()
-                success_fast, fast_err = execute_ffmpeg(cmd_fast, duration=target_merged_dur)
+                success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode, duration=target_merged_dur)
 
-                is_fast_truncated = False
-                if success_fast and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
-                    out_probe = probe_video(temp_output_file)
-                    if not out_probe or not out_probe.get("width"):
-                        success_fast = False
-                        fast_err = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
+                if not success_tc and is_hardware:
+                    print("  [提示] 硬件编码拼接异常，自动平滑切换至 CPU 软件编码 (libx264)...")
+                    cmd_concat_transcode_sw = (
+                        [
+                            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
+                            "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
+                            "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+                            "-vf", vf_filter
+                        ]
+                        + concat_seek_args
+                    )
+                    if has_any_audio:
+                        cmd_concat_transcode_sw += [
+                            "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
+                            "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"
+                        ]
                     else:
-                        out_dur = out_probe.get("duration", 0.0)
-                        if target_merged_dur > 15.0 and out_dur > 0.0:
-                            if out_dur < (target_merged_dur * 0.94) and (target_merged_dur - out_dur) > 4.0:
-                                is_fast_truncated = True
-                                fast_err = (
-                                    f"流复制剪切截断异常！预期时长: {target_merged_dur:.1f}s，"
-                                    f"产物仅: {out_dur:.1f}s"
-                                )
+                        cmd_concat_transcode_sw += ["-an"]
 
-                if success_fast and not is_fast_truncated and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+                    cmd_concat_transcode_sw += (
+                        sw_video_args
+                        + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
+                    )
+                    success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode_sw, duration=target_merged_dur)
+
+                if success_tc and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
                     duration_sec = time.time() - t_start
                     new_size = temp_output_file.stat().st_size
                     size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
@@ -3887,12 +4303,10 @@ def process_merged_videos(
                     safe_move_file(temp_output_file, final_output_file)
 
                     if has_trim:
-                        done_label = "分卷合并与剪切成功"
-                    elif is_merge_only:
-                        done_label = "单独合并成功"
+                        action_label = "多分卷合并剪切与压缩" if not is_merge_only else "多分卷合并与剪切"
                     else:
-                        done_label = "合并成功 (分卷码率已在合理区间，免二次压缩)"
-                    print(f"[完成] {done_label} (极速无损流复制)! 耗时: {duration_sec:.1f}s")
+                        action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
+                    print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
                     print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
                     print(f"  * 输出路径: {final_output_file}")
                     if vlog:
@@ -3900,14 +4314,22 @@ def process_merged_videos(
                             input_file=file_paths,
                             output_target=final_output_file,
                             status="SUCCESS",
-                            action="MERGE_TRIM_STREAM_COPY" if has_trim else ("MERGE_ONLY" if is_merge_only else "MERGE_STREAM_COPY"),
+                            action="MERGE_TRIM_COMPRESS" if has_trim else ("MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS"),
                             orig_size=total_orig_size,
                             new_size=new_size,
                             elapsed_sec=duration_sec,
                             orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
-                            details=f"极速无损流复制合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
+                            details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
                             tool="vfix"
                         )
+                    _handle_subtitles_extraction(
+                        target_file=final_output_file,
+                        enabled=subtitles,
+                        model=subtitle_model,
+                        lang=subtitle_lang,
+                        formats=subtitle_format,
+                        embed=subtitle_embed
+                    )
                     if keep_name and not delete_source:
                         for fp in file_paths:
                             orig_bak = derive_backup_source_path(fp)
@@ -3918,26 +4340,38 @@ def process_merged_videos(
                     return True
                 else:
                     safe_path_unlink(temp_output_file)
-                    reason_snippet = fast_err.strip().splitlines()[-1] if fast_err.strip() else "时间戳/封装限制"
-                    print(f"  [提示] 无损流复制拼接未通过 ({reason_snippet})，自动平滑切换至 Concat Demuxer 高保真转码拼接...")
-
-            # ----------------------------------------------------
-            # 策略 1B: Concat Demuxer 顺序流式转码合并 (合并压缩或无损复制回退)
-            # ----------------------------------------------------
-            if not is_merge_only:
-                print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
-                if is_hardware:
-                    hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
-                    print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
-                else:
-                    print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
+                    reason_snippet = tc_err.strip().splitlines()[-1] if tc_err.strip() else "未知原因"
+                    print(f"  [提示] Concat Demuxer 流式转码未通过 ({reason_snippet})，自动平滑切换至多源滤镜拼接...")
+            finally:
+                safe_path_unlink(concat_list_file)
+        else:
+            if not same_res:
+                print(f"  [提示] 各分卷视频分辨率不一致 ({', '.join(f'{w}x{h}' for w, h in resolutions)})，自动通过多源智能滤镜对齐拼接...")
+            elif not same_v_codec:
+                print(f"  [提示] 各分卷视频编码不一致 ({', '.join(str(c) for c in {p.get('codec') for p in probes})})，自动通过多源智能滤镜对齐拼接...")
             else:
-                print(f"  * 规整拼接基准: {max_w}x{max_h} @ {target_fps}fps | 高保真保留画质 (Concat Demuxer)")
-            print(f"  * 目标输出路径: {final_output_file}")
-            if has_any_audio and audio_bitrates and target_audio_kbps < 128:
-                orig_a_kbps = max(32, int((sum(audio_bitrates) / len(audio_bitrates)) / 1000))
-                print(f"  * 音频码率策略: 分卷平均音频码率 ~{orig_a_kbps} kbps，合并音频转码限制为 {target_audio_kbps} kbps (不高于原始码率)")
+                print(f"  [提示] 发现特殊音频封装或通道不一致，自动通过多源智能滤镜对齐拼接...")
 
+        # ========================================================
+        # 模式分支 2：多源智能滤镜拼接 Pipeline (多源规格不一致或底层回退)
+        # ========================================================
+        if not is_merge_only:
+            print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
+            if is_hardware:
+                hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+                print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
+            else:
+                print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
+        else:
+            print(f"  * 规整拼接基准: {max_w}x{max_h} @ {target_fps}fps | 高保真保留画质 (多源滤镜)")
+        print(f"  * 目标输出路径: {final_output_file}")
+
+        # 构建 FFmpeg 输入与复杂滤镜
+        input_args = []
+        filter_chains = []
+        input_counter = 0
+
+        if 'merge_crop_filter' not in locals():
             merge_crop_filter = ""
             if crop and detect_crop_box:
                 m_crop_info = None
@@ -3950,207 +4384,67 @@ def process_merged_videos(
                 if m_crop_info and m_crop_info.get("has_black_bars", True):
                     merge_crop_filter = f"crop={m_crop_info['crop_str']},"
 
-            if same_res:
-                # 各分卷分辨率完全一致，跳过昂贵的 CPU 重缩放与填充滤镜，大幅提升吞吐效率
-                vf_filter = f"{merge_crop_filter}fps={target_fps},setpts=PTS-STARTPTS"
-            else:
-                vf_filter = (
-                    f"{merge_crop_filter}scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
-                    f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},setpts=PTS-STARTPTS"
-                )
-            cmd_concat_transcode = (
-                [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
-                    "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
-                    "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-                    "-vf", vf_filter
-                ]
-                + concat_seek_args
+        for i, f in enumerate(file_paths):
+            v_in = input_counter
+            input_counter += 1
+            input_args.extend([
+                "-thread_queue_size", "4096",
+                "-err_detect", "ignore_err",
+                "-fflags", "+discardcorrupt",
+                "-i", str(f)
+            ])
+            filter_chains.append(
+                f"[{v_in}:v:0]{merge_crop_filter}scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
+                f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},setpts=PTS-STARTPTS[v{i}]"
             )
             if has_any_audio:
-                cmd_concat_transcode += [
-                    "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
-                    "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"
-                ]
-            else:
-                cmd_concat_transcode += ["-an"]
-
-            cmd_concat_transcode += (
-                video_encode_args
-                + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
-            )
-
-            t_start = time.time()
-            success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode, duration=target_merged_dur)
-
-            if not success_tc and is_hardware:
-                print("  [提示] 硬件编码拼接异常，自动平滑切换至 CPU 软件编码 (libx264)...")
-                cmd_concat_transcode_sw = (
-                    [
-                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
-                        "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
-                        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-                        "-vf", vf_filter
-                    ]
-                    + concat_seek_args
-                )
-                if has_any_audio:
-                    cmd_concat_transcode_sw += [
-                        "-af", "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS",
-                        "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"
-                    ]
-                else:
-                    cmd_concat_transcode_sw += ["-an"]
-
-                cmd_concat_transcode_sw += (
-                    sw_video_args
-                    + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
-                )
-                success_tc, tc_err = execute_ffmpeg(cmd_concat_transcode_sw, duration=target_merged_dur)
-
-            if success_tc and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
-                duration_sec = time.time() - t_start
-                new_size = temp_output_file.stat().st_size
-                size_change = (new_size - total_orig_size) / total_orig_size * 100 if total_orig_size > 0 else 0
-
-                safe_move_file(temp_output_file, final_output_file)
-
-                if has_trim:
-                    action_label = "多分卷合并剪切与压缩" if not is_merge_only else "多分卷合并与剪切"
-                else:
-                    action_label = "单独合并与规整" if is_merge_only else "多分卷合并与压缩"
-                print(f"[完成] {action_label}成功! 耗时: {duration_sec:.1f}s")
-                print(f"  * 原始总体积: {format_bytes(total_orig_size)} -> 合并后大小: {format_bytes(new_size)} ({size_change:+.1f}%)")
-                print(f"  * 输出路径: {final_output_file}")
-                if vlog:
-                    vlog.log_processed(
-                        input_file=file_paths,
-                        output_target=final_output_file,
-                        status="SUCCESS",
-                        action="MERGE_TRIM_COMPRESS" if has_trim else ("MERGE_STANDARDIZE" if is_merge_only else "MERGE_COMPRESS"),
-                        orig_size=total_orig_size,
-                        new_size=new_size,
-                        elapsed_sec=duration_sec,
-                        orig_info={"width": max_w, "height": max_h, "fps": target_fps, "bitrate": avg_v_bps},
-                        details=f"Concat Demuxer 流式转码合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
-                        tool="vfix"
+                mode = audio_modes[i]
+                if mode == "vorbis_acm" and salvaged_audio_files[i]:
+                    a_in = input_counter
+                    input_counter += 1
+                    input_args.extend([
+                        "-thread_queue_size", "4096",
+                        "-err_detect", "ignore_err",
+                        "-i", str(salvaged_audio_files[i])
+                    ])
+                    filter_chains.append(
+                        f"[{a_in}:a:0]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
                     )
-                if keep_name and not delete_source:
-                    for fp in file_paths:
-                        orig_bak = derive_backup_source_path(fp)
-                        safe_move_file(fp, orig_bak)
-                        print(f"  * [分卷原文件已重命名备份]: {orig_bak.name}")
-                elif delete_source:
-                    remove_source_files(file_paths, final_output_file, reason="分卷合并成功后安全清理源文件 (--delete-source)")
-                return True
-            else:
-                safe_path_unlink(temp_output_file)
-                reason_snippet = tc_err.strip().splitlines()[-1] if tc_err.strip() else "未知原因"
-                print(f"  [提示] Concat Demuxer 流式转码未通过 ({reason_snippet})，自动平滑切换至多源滤镜拼接...")
-        finally:
-            safe_path_unlink(concat_list_file)
-    else:
-        if not same_res:
-            print(f"  [提示] 各分卷视频分辨率不一致 ({', '.join(f'{w}x{h}' for w, h in resolutions)})，自动通过多源智能滤镜对齐拼接...")
-        elif not same_v_codec:
-            print(f"  [提示] 各分卷视频编码不一致 ({', '.join(str(c) for c in {p.get('codec') for p in probes})})，自动通过多源智能滤镜对齐拼接...")
-        else:
-            print(f"  [提示] 发现特殊音频封装或通道不一致，自动通过多源智能滤镜对齐拼接...")
+                elif mode in ("copy", "aac"):
+                    filter_chains.append(
+                        f"[{v_in}:a:0]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                else:
+                    dur = probes[i].get("duration", 0.0)
+                    dur_str = f",atrim=end={dur:.3f}" if dur > 0 else ""
+                    filter_chains.append(
+                        f"anullsrc=r=44100:cl=stereo{dur_str},asetpts=PTS-STARTPTS[a{i}]"
+                    )
 
-    # ========================================================
-    # 模式分支 2：多源智能滤镜拼接 Pipeline (多源规格不一致或底层回退)
-    # ========================================================
-    if not is_merge_only:
-        print(f"  * 合并基准画质: {max_w}x{max_h} @ {target_fps}fps | 目标码率: ~{format_bitrate(target_bps)}")
-        if is_hardware:
-            hw_name = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
-            print(f"  * 编码配置: {hw_name} 硬件极速加速 ({encoder})")
-        else:
-            print(f"  * 编码配置: CPU 软件编码 ({encoder}, CRF: {crf}, Preset: {preset})")
-    else:
-        print(f"  * 规整拼接基准: {max_w}x{max_h} @ {target_fps}fps | 高保真保留画质 (多源滤镜)")
-    print(f"  * 目标输出路径: {final_output_file}")
-
-    # 构建 FFmpeg 输入与复杂滤镜
-    input_args = []
-    filter_chains = []
-    input_counter = 0
-
-    if 'merge_crop_filter' not in locals():
-        merge_crop_filter = ""
-        if crop and detect_crop_box:
-            m_crop_info = None
-            if crop != "auto" and ":" in str(crop):
-                parts = str(crop).strip().split(":")
-                if len(parts) == 4:
-                    m_crop_info = {"crop_str": f"{parts[0]}:{parts[1]}:{parts[2]}:{parts[3]}"}
-            else:
-                m_crop_info = detect_crop_box(file_paths[0], max_w, max_h, probes[0].get("duration", 0.0), target_aspect=aspect)
-            if m_crop_info and m_crop_info.get("has_black_bars", True):
-                merge_crop_filter = f"crop={m_crop_info['crop_str']},"
-
-    for i, f in enumerate(file_paths):
-        v_in = input_counter
-        input_counter += 1
-        input_args.extend([
-            "-thread_queue_size", "4096",
-            "-err_detect", "ignore_err",
-            "-fflags", "+discardcorrupt",
-            "-i", str(f)
-        ])
-        filter_chains.append(
-            f"[{v_in}:v:0]{merge_crop_filter}scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
-            f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps},setpts=PTS-STARTPTS[v{i}]"
-        )
         if has_any_audio:
-            mode = audio_modes[i]
-            if mode == "vorbis_acm" and salvaged_audio_files[i]:
-                a_in = input_counter
-                input_counter += 1
-                input_args.extend([
-                    "-thread_queue_size", "4096",
-                    "-err_detect", "ignore_err",
-                    "-i", str(salvaged_audio_files[i])
-                ])
-                filter_chains.append(
-                    f"[{a_in}:a:0]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
-                )
-            elif mode in ("copy", "aac"):
-                filter_chains.append(
-                    f"[{v_in}:a:0]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1000:min_hard_comp=0.1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
-                )
-            else:
-                dur = probes[i].get("duration", 0.0)
-                dur_str = f",atrim=end={dur:.3f}" if dur > 0 else ""
-                filter_chains.append(
-                    f"anullsrc=r=44100:cl=stereo{dur_str},asetpts=PTS-STARTPTS[a{i}]"
-                )
+            concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n_files)])
+            filter_chains.append(f"{concat_inputs}concat=n={n_files}:v=1:a=1[v][a]")
+            if audio_bitrates and target_audio_kbps < 128:
+                orig_a_kbps = max(32, int((sum(audio_bitrates) / len(audio_bitrates)) / 1000))
+                print(f"  * 音频码率策略: 分卷平均音频码率 ~{orig_a_kbps} kbps，合并音频转码限制为 {target_audio_kbps} kbps (不高于原始码率)")
+            audio_encode_args = ["-map", "[a]", "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"]
+        else:
+            concat_inputs = "".join([f"[v{i}]" for i in range(n_files)])
+            filter_chains.append(f"{concat_inputs}concat=n={n_files}:v=1:a=0[v]")
+            audio_encode_args = ["-an"]
 
-    if has_any_audio:
-        concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n_files)])
-        filter_chains.append(f"{concat_inputs}concat=n={n_files}:v=1:a=1[v][a]")
-        if audio_bitrates and target_audio_kbps < 128:
-            orig_a_kbps = max(32, int((sum(audio_bitrates) / len(audio_bitrates)) / 1000))
-            print(f"  * 音频码率策略: 分卷平均音频码率 ~{orig_a_kbps} kbps，合并音频转码限制为 {target_audio_kbps} kbps (不高于原始码率)")
-        audio_encode_args = ["-map", "[a]", "-c:a", "aac", "-b:a", f"{target_audio_kbps}k"]
-    else:
-        concat_inputs = "".join([f"[v{i}]" for i in range(n_files)])
-        filter_chains.append(f"{concat_inputs}concat=n={n_files}:v=1:a=0[v]")
-        audio_encode_args = ["-an"]
+        filter_complex = ";".join(filter_chains)
 
-    filter_complex = ";".join(filter_chains)
+        cmd_merge = (
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0"]
+            + input_args
+            + ["-filter_complex", filter_complex, "-map", "[v]"]
+            + concat_seek_args
+            + video_encode_args
+            + audio_encode_args
+            + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
+        )
 
-    cmd_merge = (
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0"]
-        + input_args
-        + ["-filter_complex", filter_complex, "-map", "[v]"]
-        + concat_seek_args
-        + video_encode_args
-        + audio_encode_args
-        + ["-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", "-movflags", "+faststart", str(temp_output_file)]
-    )
-
-    try:
         t_start = time.time()
         success, last_err_msg = execute_ffmpeg(cmd_merge, duration=target_merged_dur)
 
@@ -4228,6 +4522,14 @@ def process_merged_videos(
                     details=f"多源滤镜对齐拼接合并 ({n_files} 个分卷){' [带剪切]' if has_trim else ''}",
                     tool="vfix"
                 )
+            _handle_subtitles_extraction(
+                target_file=final_output_file,
+                enabled=subtitles,
+                model=subtitle_model,
+                lang=subtitle_lang,
+                formats=subtitle_format,
+                embed=subtitle_embed
+            )
             if keep_name and not delete_source:
                 for fp in file_paths:
                     orig_bak = derive_backup_source_path(fp)
@@ -4261,7 +4563,10 @@ def process_merged_videos(
         safe_path_unlink(concat_list_file)
         if salvaged_audio_files:
             for sf in salvaged_audio_files:
-                safe_path_unlink(sf)
+                if sf:
+                    safe_path_unlink(sf)
+        TempFileManager.cleanup_stale_temp_files(custom_dirs=[temp_dir])
+
 
 
 def normalize_cli_args(raw_args: List[str]) -> List[str]:
@@ -4372,6 +4677,27 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
             continue
         if arg == "-stop":
             norm_args.append("--stop")
+            i += 1
+            continue
+
+        # 临时缓存清理与自定义临时目录容错
+        if arg in ("--clean-tmp", "--clean-temp", "-clean-tmp", "-clean-temp"):
+            norm_args.append("--clean-tmp")
+            i += 1
+            continue
+
+        if arg in ("--temp-dir", "-temp-dir", "--tempdir", "-tempdir"):
+            if i + 1 < len(raw_args):
+                norm_args.extend(["--temp-dir", raw_args[i + 1]])
+                i += 2
+                continue
+            norm_args.append("--temp-dir")
+            i += 1
+            continue
+
+        if arg.startswith(("--temp-dir=", "-temp-dir=", "--tempdir=", "-tempdir=")):
+            val = arg.split("=", 1)[1]
+            norm_args.extend(["--temp-dir", val])
             i += 1
             continue
 
@@ -4610,6 +4936,10 @@ def main():
    vfix /mnt/nas/videos/ -r -d -B               # 后台脱机递归处理整个目录并安全清理源文件
    vfix --status                                # 实时查看后台任务运行状态、当前进度与最新日志
    vfix --stop                                  # 安全终止后台任务 (严格保护源文件，清理临时缓存)
+
+10. 临时缓存清理与磁盘空间管理 (杜绝 /tmp tmpfs 内存盘打满):
+   vfix --clean-tmp                             # 深度扫描并清理历史遗留的临时缓存与僵尸文件
+   vfix video.mp4 --temp-dir /userdata/tmp      # 指定自定义大容量分区作为临时暂存目录
 ================================================================================
 """
     )
@@ -4688,6 +5018,20 @@ def main():
     parser.add_argument("--force-repair-only", action="store_true",
                         help="强制仅修复损坏封装结构与音视频同步 (不重新编码，0 耗时)")
 
+    # 智能语音字幕提取配套 (video_subtitles / vsub)
+    sub_group = parser.add_argument_group("智能语音字幕提取 (配套 video_subtitles / vsub)")
+    sub_group.add_argument("-S", "--subtitles", "--extract-subtitles", dest="subtitles", action="store_true",
+                           help="转码/修复完成后自动提取语音字幕 (默认输出同名 .srt 外挂字幕)")
+    sub_group.add_argument("--subtitle-model", dest="subtitle_model", type=str, default="large-v3-turbo",
+                           help="字幕 Whisper 模型 (默认: large-v3-turbo，可选 small/medium/large-v3-turbo 等)")
+    sub_group.add_argument("--subtitle-lang", dest="subtitle_lang", type=str, default=None,
+                           help="指定字幕语言代码 (如 zh, en, ja；默认自动探测)")
+    sub_group.add_argument("--subtitle-format", dest="subtitle_format", nargs="+",
+                           choices=["srt", "vtt", "txt", "json", "all"], default=["srt"],
+                           help="字幕输出格式 (默认: srt)")
+    sub_group.add_argument("--subtitle-embed", dest="subtitle_embed", action="store_true",
+                           help="将提取的字幕直接软封装混流回视频容器中")
+
     # 运行审计与日志记录 (默认 100% 自动记录至 ~/.vfix/logs/)
     log_group = parser.add_argument_group("运行审计与日志记录 (默认全自动生成)")
     log_group.add_argument("--log-dir", type=str, default=None,
@@ -4695,8 +5039,34 @@ def main():
     log_group.add_argument("--no-log", action="store_true",
                            help="禁用所有文件处理与删除日志记录 (默认已开启自动记录)")
 
+    # 临时缓存清理与存储控制 (杜绝磁盘满)
+    tmp_group = parser.add_argument_group("临时存储与磁盘空间安全管理 (杜绝磁盘写满)")
+    tmp_group.add_argument("--clean-tmp", "--clean-temp", dest="clean_tmp", action="store_true",
+                           help="扫描并彻底清理历史遗留的僵尸临时文件 (因异常中断、断电等残留的 vrc_* / _vfix_* / vcrop_* 缓存并释放空间)")
+    tmp_group.add_argument("--temp-dir", dest="temp_dir", type=str, default=None,
+                           help="指定自定义临时文件暂存目录 (默认自动优先选用大容量持久存储如 ~/.vfix/tmp 或 /var/tmp，杜绝 /tmp tmpfs 内存盘打满)")
+
     norm_argv = normalize_cli_args(sys.argv[1:])
     args = parser.parse_args(norm_argv)
+
+    if args.temp_dir:
+        custom_tmp = Path(args.temp_dir).expanduser().resolve()
+        custom_tmp.mkdir(parents=True, exist_ok=True)
+        os.environ["VFIX_TEMP_DIR"] = str(custom_tmp)
+
+    if args.clean_tmp:
+        print("[临时文件清理] 正在扫描历史遗留的临时缓存与僵尸文件...")
+        cnt, b = TempFileManager.cleanup_stale_temp_files(verbose=True)
+        if cnt > 0:
+            print(f"[清理完成] 共清理 {cnt} 个遗留临时文件，成功释放磁盘空间: {format_bytes(b)}。")
+        else:
+            print("[清理完成] 系统环境非常干净，未发现需要清理的遗留临时文件。")
+        sys.exit(0)
+
+    # 启动自检并安全回收先前异常中断遗留的死进程缓存
+    stale_cnt, stale_bytes = TempFileManager.cleanup_stale_temp_files(verbose=False)
+    if stale_bytes > 0:
+        print(f"  * [空间卫士] 启动自检: 已自动回收先前异常中断遗留的 {stale_cnt} 个僵尸缓存文件 (释放 {format_bytes(stale_bytes)})")
 
     global DAEMON_MGR
     vlog.setup_logger(log_dir=args.log_dir, enabled=not args.no_log, tool_name="vfix")
@@ -4720,6 +5090,7 @@ def main():
         print("    vfix *.mp4 -B                                  # 后台脱机批量处理当前目录所有视频")
         print("    vfix --status                                  # 查看后台任务运行状态与实时日志")
         print("    vfix --stop                                    # 安全停止当前后台任务")
+        print("    vfix --clean-tmp                               # 扫描并清理历史遗留的临时缓存与僵尸文件")
         sys.exit(1)
 
     setup_signal_handlers()
@@ -4795,7 +5166,12 @@ def main():
                 keep_name=args.keep_name,
                 ss=args.ss,
                 to=args.to,
-                duration_limit=args.duration
+                duration_limit=args.duration,
+                subtitles=args.subtitles,
+                subtitle_model=args.subtitle_model,
+                subtitle_lang=args.subtitle_lang,
+                subtitle_format=args.subtitle_format,
+                subtitle_embed=args.subtitle_embed
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4825,7 +5201,12 @@ def main():
                 keep_name=args.keep_name,
                 ss=args.ss,
                 to=args.to,
-                duration_limit=args.duration
+                duration_limit=args.duration,
+                subtitles=args.subtitles,
+                subtitle_model=args.subtitle_model,
+                subtitle_lang=args.subtitle_lang,
+                subtitle_format=args.subtitle_format,
+                subtitle_embed=args.subtitle_embed
             )
             total_cost = time.time() - session_start_time
             if vlog:
@@ -4870,7 +5251,12 @@ def main():
             keep_name=args.keep_name,
             ss=args.ss,
             to=args.to,
-            duration_limit=args.duration
+            duration_limit=args.duration,
+            subtitles=args.subtitles,
+            subtitle_model=args.subtitle_model,
+            subtitle_lang=args.subtitle_lang,
+            subtitle_format=args.subtitle_format,
+            subtitle_embed=args.subtitle_embed
         )
         if ok:
             success_count += 1

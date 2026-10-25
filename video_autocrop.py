@@ -52,7 +52,7 @@ import signal
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
 
 # ==============================================================================
 # 自包含通用日志记录与后台守护引擎 (100% 自动生成，单文件独立运行无任何外部依赖)
@@ -788,33 +788,189 @@ def make_safe_filename(stem: str, suffix: str = ".mp4", max_total_bytes: int = 2
     return f"{safe_stem}{suffix}"
 
 
-def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
-    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes。"""
-    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
-    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
-    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
-    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
-    return temp_dir / f"{prefix}{safe_stem}{suffix}"
-
-
-def safe_path_exists(p: Optional[Path]) -> bool:
-    """安全判定文件是否存在，防御任何底层文件名过长 (ENAMETOOLONG / Errno 36) 或权限异常。"""
-    if p is None:
-        return False
-    try:
-        return p.exists()
-    except (OSError, ValueError):
-        return False
-
-
 def safe_path_unlink(p: Optional[Path]) -> None:
-    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常。"""
+    """安全删除临时文件，吸收并防御任何底层文件名过长或权限异常，并自动从临时文件管理器中注销。"""
     if p is None:
         return
+    try:
+        TempFileManager.unregister(p)
+    except Exception:
+        pass
     try:
         p.unlink(missing_ok=True)
     except (OSError, ValueError):
         pass
+
+
+class TempFileManager:
+    """全局临时文件生命周期管理与安全回收中心 (自包含独立版)"""
+    _registered_files: Set[Path] = set()
+    _lock = threading.Lock()
+    PATTERNS = [
+        re.compile(r"^vrc_(?:merge_)?(?:salvage_)?(?:concat_)?(\d+)_"),
+        re.compile(r"^_vfix_.*_(\d+)\."),
+        re.compile(r"^vfix_salvaged_(\d+)_"),
+        re.compile(r"^vcrop_(?:split_)?(\d+)_"),
+        re.compile(r"^untrunc_salvage_(\d+)_"),
+        re.compile(r"\.vfix_tmp\.(\d+)$"),
+        re.compile(r"\.vcrop_tmp\.(\d+)$"),
+    ]
+    @classmethod
+    def register(cls, path: Optional[Union[str, Path]]) -> Optional[Path]:
+        if path is None:
+            return None
+        try:
+            p = Path(path).resolve()
+            with cls._lock:
+                cls._registered_files.add(p)
+            return p
+        except Exception:
+            return Path(path) if isinstance(path, str) else path
+    @classmethod
+    def unregister(cls, path: Optional[Union[str, Path]]) -> None:
+        if path is None:
+            return
+        try:
+            p = Path(path).resolve()
+            with cls._lock:
+                cls._registered_files.discard(p)
+        except Exception:
+            pass
+    @classmethod
+    def safe_unlink(cls, path: Optional[Union[str, Path]]) -> None:
+        if path is None:
+            return
+        cls.unregister(path)
+        safe_path_unlink(path)
+    @classmethod
+    def cleanup_active(cls) -> int:
+        with cls._lock:
+            files_to_clean = list(cls._registered_files)
+            cls._registered_files.clear()
+        cleaned_count = 0
+        for p in files_to_clean:
+            if safe_path_exists(p):
+                try:
+                    p.unlink(missing_ok=True)
+                    cleaned_count += 1
+                except Exception:
+                    pass
+        return cleaned_count
+    @classmethod
+    def is_pid_alive(cls, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as err:
+            return err.errno == errno.EPERM
+    @classmethod
+    def cleanup_stale_temp_files(cls, custom_dirs: Optional[List[Union[str, Path]]] = None, verbose: bool = False) -> Tuple[int, int]:
+        dirs_to_check = set()
+        if custom_dirs:
+            for d in custom_dirs:
+                if d:
+                    try:
+                        dirs_to_check.add(Path(d).expanduser().resolve())
+                    except Exception:
+                        pass
+        env_dir = os.environ.get("VFIX_TEMP_DIR")
+        if env_dir:
+            try:
+                dirs_to_check.add(Path(env_dir).expanduser().resolve())
+            except Exception:
+                pass
+        dirs_to_check.add(Path.home() / ".vfix" / "tmp")
+        dirs_to_check.add(Path("/var/tmp"))
+        dirs_to_check.add(Path(tempfile.gettempdir()))
+        cleaned_count = 0
+        cleaned_bytes = 0
+        current_pid = os.getpid()
+        for d in dirs_to_check:
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for item in d.iterdir():
+                    if not item.is_file():
+                        continue
+                    name = item.name
+                    matched_pid = None
+                    for pat in cls.PATTERNS:
+                        m = pat.search(name)
+                        if m:
+                            matched_pid = int(m.group(1))
+                            break
+                    is_stale = False
+                    reason = ""
+                    if matched_pid is not None:
+                        if matched_pid != current_pid and not cls.is_pid_alive(matched_pid):
+                            is_stale = True
+                            reason = f"属主进程 PID {matched_pid} 已退出"
+                    elif name.startswith(("vrc_", "_vfix_", "vcrop_", "untrunc_salvage_")) or name == "sps_pps_tmp.h264":
+                        try:
+                            age = time.time() - item.stat().st_mtime
+                            if age > 1800:
+                                is_stale = True
+                                reason = f"过期残留 ({age/60:.0f} 分钟前生成)"
+                        except Exception:
+                            pass
+                    if is_stale:
+                        try:
+                            f_size = item.stat().st_size
+                            item.unlink(missing_ok=True)
+                            cleaned_count += 1
+                            cleaned_bytes += f_size
+                            if verbose:
+                                print(f"  * [清理垃圾] {item} (原因: {reason})")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return cleaned_count, cleaned_bytes
+    @classmethod
+    def get_optimal_temp_dir(cls, needed_bytes: int = 0) -> Path:
+        env_dir = os.environ.get("VFIX_TEMP_DIR")
+        if env_dir:
+            p = Path(env_dir).expanduser().resolve()
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                if os.access(p, os.W_OK):
+                    return p
+            except Exception:
+                pass
+        vfix_tmp = Path.home() / ".vfix" / "tmp"
+        var_tmp = Path("/var/tmp")
+        sys_tmp = Path(tempfile.gettempdir())
+        candidates = []
+        for c in [vfix_tmp, var_tmp, sys_tmp]:
+            try:
+                c.mkdir(parents=True, exist_ok=True)
+                if os.access(c, os.W_OK):
+                    candidates.append((c, shutil.disk_usage(c).free))
+            except Exception:
+                continue
+        if not candidates:
+            fallback = Path(tempfile.gettempdir())
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+
+atexit.register(TempFileManager.cleanup_active)
+
+
+def make_safe_temp_path(temp_dir: Path, prefix: str, stem: str, suffix: str = ".mp4", max_total_bytes: int = 240) -> Path:
+    """生成在 temp_dir 下的临时文件 Path，确保 prefix + stem + suffix 的整体文件名不超过 max_total_bytes，
+    并自动注册到 TempFileManager 进行生命周期跟踪与回收兜底。
+    """
+    prefix_bytes = len(prefix.encode("utf-8", errors="ignore"))
+    suffix_bytes = len(suffix.encode("utf-8", errors="ignore"))
+    avail_stem_bytes = max(10, max_total_bytes - prefix_bytes - suffix_bytes)
+    safe_stem = safe_truncate_name(stem, max_bytes=avail_stem_bytes)
+    path = temp_dir / f"{prefix}{safe_stem}{suffix}"
+    TempFileManager.register(path)
+    return path
 
 
 def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
@@ -827,16 +983,19 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
     # 1. 同一文件系统尝试原子替换
     try:
         os.replace(src, dst)
+        TempFileManager.unregister(src)
         return
     except OSError as e:
         if e.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENXIO, errno.ENOTSUP, errno.EBADF):
             if src.resolve() == dst.resolve():
+                TempFileManager.unregister(src)
                 return
             raise
 
     # 2. 跨设备/网络挂载点安全流式分块传输与重试
     src_size = src.stat().st_size
     temp_dst = dst.with_name(f".{dst.name}.vcrop_tmp.{os.getpid()}")
+    TempFileManager.register(temp_dst)
     chunk_size = 16 * 1024 * 1024  # 16 MB 缓冲区
 
     TRANSIENT_ERRNOS = {
@@ -858,7 +1017,7 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if temp_dst.exists():
-                temp_dst.unlink(missing_ok=True)
+                TempFileManager.safe_unlink(temp_dst)
 
             with open(src, "rb") as fsrc, open(temp_dst, "wb") as fdst:
                 while True:
@@ -888,16 +1047,16 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
                 else:
                     raise replace_err
 
+            # 校验完成，删除源临时文件并注销跟踪
             src.unlink(missing_ok=True)
+            TempFileManager.unregister(src)
+            TempFileManager.unregister(temp_dst)
             return
 
         except OSError as e:
             last_error = e
             if temp_dst.exists():
-                try:
-                    temp_dst.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                TempFileManager.safe_unlink(temp_dst)
 
             is_transient = e.errno in TRANSIENT_ERRNOS or "Bad file descriptor" in str(e)
             if is_transient and attempt < max_retries:
@@ -911,10 +1070,7 @@ def safe_move_file(src: Path, dst: Path, max_retries: int = 5) -> None:
         except Exception as e:
             last_error = e
             if temp_dst.exists():
-                try:
-                    temp_dst.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                TempFileManager.safe_unlink(temp_dst)
             break
 
     print(f"\n  [严重错误] 目标路径无法写入 ({dst}): {last_error}", file=sys.stderr)
@@ -1561,7 +1717,7 @@ CURRENT_ACTIVE_PROCESS: Optional[subprocess.Popen] = None
 
 
 def setup_signal_handlers():
-    """注册进程信号处理，确保被 SIGTERM/SIGHUP 终止时妥善清理子进程 FFmpeg"""
+    """注册进程信号处理，确保被 SIGINT/SIGTERM/SIGHUP 终止时妥善清理子进程 FFmpeg 及中间临时文件"""
     def handle_termination(signum, frame):
         global CURRENT_ACTIVE_PROCESS
         if CURRENT_ACTIVE_PROCESS:
@@ -1573,9 +1729,14 @@ def setup_signal_handlers():
                     CURRENT_ACTIVE_PROCESS.kill()
                 except Exception:
                     pass
-        sys.exit(143)
+        cleaned = TempFileManager.cleanup_active()
+        if cleaned > 0:
+            sys.stderr.write(f"\n[清理] 已安全回收中断产生的 {cleaned} 个临时缓存文件。\n")
+        exit_code = 130 if signum == signal.SIGINT else 143
+        sys.exit(exit_code)
 
     try:
+        signal.signal(signal.SIGINT, handle_termination)
         signal.signal(signal.SIGTERM, handle_termination)
         signal.signal(signal.SIGHUP, handle_termination)
     except Exception:
@@ -1704,7 +1865,7 @@ def execute_ffmpeg_with_progress(
             return False, err_msg
         return True, ""
     except KeyboardInterrupt:
-        sys.stdout.write("\n  [中断] 接收到终止信号，正在退出 FFmpeg 进程...\n")
+        sys.stdout.write("\n  [中断] 接收到终止信号，正在退出 FFmpeg 进程并清理临时文件...\n")
         sys.stdout.flush()
         try:
             proc.terminate()
@@ -1714,6 +1875,7 @@ def execute_ffmpeg_with_progress(
                 proc.kill()
             except Exception:
                 pass
+        TempFileManager.cleanup_active()
         raise
     except Exception as e:
         return False, str(e)
@@ -2120,139 +2282,112 @@ def process_video_with_splits(
         print(f"  * 画幅风格: {aspect_name} ({kind})")
         print(f"  * 裁切区域: {crop_info['crop_str']} (裁后分辨率: {crop_info['w']}x{crop_info['h']})")
 
-        temp_part_file = Path(tempfile.gettempdir()) / f"vcrop_split_{os.getpid()}_{idx}_{part_filename}"
+        temp_dir = TempFileManager.get_optimal_temp_dir()
+        temp_part_file = temp_dir / f"vcrop_split_{os.getpid()}_{idx}_{part_filename}"
+        TempFileManager.register(temp_part_file)
         if temp_part_file.exists():
-            temp_part_file.unlink(missing_ok=True)
+            TempFileManager.safe_unlink(temp_part_file)
 
-        pixel_ratio = (crop_info["w"] * crop_info["h"]) / max(1, orig_w * orig_h)
-        if bitrate_kbps:
-            target_bps = bitrate_kbps * 1000
-        else:
-            calc_bps = int(ref_v_bitrate * pixel_ratio * 0.95)
-            target_bps = max(120_000, min(int(ref_v_bitrate), calc_bps))
-
-        is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
-        video_args: List[str] = []
-        if is_hardware:
-            max_rate_limit = min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15))
-            buf_size_limit = int(target_bps * 2.0)
-            if encoder == "hevc_videotoolbox":
-                video_args = [
-                    "-c:v", "hevc_videotoolbox",
-                    "-b:v", str(target_bps),
-                    "-profile:v", "main",
-                    "-spatial_aq", "1",
-                    "-bf", "2",
-                    "-tag:v", "hvc1",
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", str(max_rate_limit),
-                    "-bufsize", str(buf_size_limit)
-                ] + color_args
-            elif encoder == "hevc_rkmpp":
-                video_args = [
-                    "-c:v", "hevc_rkmpp",
-                    "-b:v", str(target_bps),
-                    "-profile", "main",
-                    "-rc_mode", "0",
-                    "-tag:v", "hvc1",
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", str(max_rate_limit),
-                    "-bufsize", str(buf_size_limit)
-                ]
-            elif encoder == "h264_rkmpp":
-                video_args = [
-                    "-c:v", "h264_rkmpp",
-                    "-b:v", str(target_bps),
-                    "-profile", "high",
-                    "-rc_mode", "0",
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", str(max_rate_limit),
-                    "-bufsize", str(buf_size_limit)
-                ]
+        try:
+            pixel_ratio = (crop_info["w"] * crop_info["h"]) / max(1, orig_w * orig_h)
+            if bitrate_kbps:
+                target_bps = bitrate_kbps * 1000
             else:
-                video_args = [
-                    "-c:v", "h264_videotoolbox",
-                    "-b:v", str(target_bps),
-                    "-profile:v", "high",
-                    "-spatial_aq", "1",
-                    "-bf", "2",
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", str(max_rate_limit),
-                    "-bufsize", str(buf_size_limit)
-                ] + color_args
-        else:
-            cpu_maxrate = str(min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15)))
-            cpu_bufsize = str(int(target_bps * 2.0))
-            if encoder == "libx265":
-                video_args = [
-                    "-c:v", "libx265",
-                    "-crf", str(crf),
-                    "-preset", preset,
-                    "-tag:v", "hvc1",
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", cpu_maxrate,
-                    "-bufsize", cpu_bufsize
-                ] + color_args
+                calc_bps = int(ref_v_bitrate * pixel_ratio * 0.95)
+                target_bps = max(120_000, min(int(ref_v_bitrate), calc_bps))
+
+            is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
+            video_args: List[str] = []
+            if is_hardware:
+                max_rate_limit = min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15))
+                buf_size_limit = int(target_bps * 2.0)
+                if encoder == "hevc_videotoolbox":
+                    video_args = [
+                        "-c:v", "hevc_videotoolbox",
+                        "-b:v", str(target_bps),
+                        "-profile:v", "main",
+                        "-spatial_aq", "1",
+                        "-bf", "2",
+                        "-tag:v", "hvc1",
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", str(max_rate_limit),
+                        "-bufsize", str(buf_size_limit)
+                    ] + color_args
+                elif encoder == "hevc_rkmpp":
+                    video_args = [
+                        "-c:v", "hevc_rkmpp",
+                        "-b:v", str(target_bps),
+                        "-profile", "main",
+                        "-rc_mode", "0",
+                        "-tag:v", "hvc1",
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", str(max_rate_limit),
+                        "-bufsize", str(buf_size_limit)
+                    ]
+                elif encoder == "h264_rkmpp":
+                    video_args = [
+                        "-c:v", "h264_rkmpp",
+                        "-b:v", str(target_bps),
+                        "-profile", "high",
+                        "-rc_mode", "0",
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", str(max_rate_limit),
+                        "-bufsize", str(buf_size_limit)
+                    ]
+                else:
+                    video_args = [
+                        "-c:v", "h264_videotoolbox",
+                        "-b:v", str(target_bps),
+                        "-profile:v", "high",
+                        "-spatial_aq", "1",
+                        "-bf", "2",
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", str(max_rate_limit),
+                        "-bufsize", str(buf_size_limit)
+                    ] + color_args
             else:
-                video_args = [
-                    "-c:v", "libx264",
-                    "-crf", str(crf),
-                    "-preset", preset,
-                    "-pix_fmt", "yuv420p",
-                    "-g", str(gop_size),
-                    "-maxrate", cpu_maxrate,
-                    "-bufsize", cpu_bufsize
-                ] + color_args
+                cpu_maxrate = str(min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15)))
+                cpu_bufsize = str(int(target_bps * 2.0))
+                if encoder == "libx265":
+                    video_args = [
+                        "-c:v", "libx265",
+                        "-crf", str(crf),
+                        "-preset", preset,
+                        "-tag:v", "hvc1",
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", cpu_maxrate,
+                        "-bufsize", cpu_bufsize
+                    ] + color_args
+                else:
+                    video_args = [
+                        "-c:v", "libx264",
+                        "-crf", str(crf),
+                        "-preset", preset,
+                        "-pix_fmt", "yuv420p",
+                        "-g", str(gop_size),
+                        "-maxrate", cpu_maxrate,
+                        "-bufsize", cpu_bufsize
+                    ] + color_args
 
-        # 音频参数
-        if audio_mode == "copy":
-            audio_args = ["-c:a", "copy"]
-        elif audio_mode == "aac":
-            audio_args = ["-c:a", "aac", "-b:a", "128k"]
-        else:
-            audio_args = ["-an"]
+            # 音频参数
+            if audio_mode == "copy":
+                audio_args = ["-c:a", "copy"]
+            elif audio_mode == "aac":
+                audio_args = ["-c:a", "aac", "-b:a", "128k"]
+            else:
+                audio_args = ["-an"]
 
-        # 两级精准 Seek 策略：前置 fast_seek (至多提前 10 秒) 跳转至关键帧附近，
-        # 后置 fine_seek 精准丢弃前导帧，彻底消除关键帧跨度导致的上一片段画面残留！
-        fast_seek = max(0.0, s - 10.0)
-        fine_seek = s - fast_seek
+            # 两级精准 Seek 策略：前置 fast_seek (至多提前 10 秒) 跳转至关键帧附近，
+            # 后置 fine_seek 精准丢弃前导帧，彻底消除关键帧跨度导致的上一片段画面残留！
+            fast_seek = max(0.0, s - 10.0)
+            fine_seek = s - fast_seek
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-err_detect", "ignore_err",
-            "-fflags", "+discardcorrupt",
-            "-ss", f"{fast_seek:.3f}",
-            "-i", str(file_path),
-            "-ss", f"{fine_seek:.3f}",
-            "-t", f"{seg_dur:.3f}",
-            "-vf", f"crop={crop_info['crop_str']}",
-            "-map", "0:v:0",
-            "-map", "0:a?"
-        ] + video_args + audio_args + [
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            str(temp_part_file)
-        ]
-
-        t_part_start = time.time()
-        success, err_msg = execute_ffmpeg_with_progress(
-            cmd,
-            seg_dur,
-            current_file=final_part_path,
-            current_idx=idx,
-            total_files=len(segments)
-        )
-
-        # 音频 copy 若在切片边界异常，回退 aac
-        if not success and audio_mode == "copy":
-            fallback_cmd = [
+            cmd = [
                 "ffmpeg", "-y",
                 "-hide_banner",
                 "-loglevel", "error",
@@ -2265,27 +2400,60 @@ def process_video_with_splits(
                 "-vf", f"crop={crop_info['crop_str']}",
                 "-map", "0:v:0",
                 "-map", "0:a?"
-            ] + video_args + ["-c:a", "aac", "-b:a", "128k", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(temp_part_file)]
+            ] + video_args + audio_args + [
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(temp_part_file)
+            ]
+
+            t_part_start = time.time()
             success, err_msg = execute_ffmpeg_with_progress(
-                fallback_cmd,
+                cmd,
                 seg_dur,
                 current_file=final_part_path,
                 current_idx=idx,
                 total_files=len(segments)
             )
 
-        if not success or not temp_part_file.exists() or temp_part_file.stat().st_size == 0:
-            print(f"  [错误] 分段 {idx} 转码失败: {err_msg}", file=sys.stderr)
-            if temp_part_file.exists():
-                temp_part_file.unlink(missing_ok=True)
-            continue
+            # 音频 copy 若在切片边界异常，回退 aac
+            if not success and audio_mode == "copy":
+                fallback_cmd = [
+                    "ffmpeg", "-y",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-err_detect", "ignore_err",
+                    "-fflags", "+discardcorrupt",
+                    "-ss", f"{fast_seek:.3f}",
+                    "-i", str(file_path),
+                    "-ss", f"{fine_seek:.3f}",
+                    "-t", f"{seg_dur:.3f}",
+                    "-vf", f"crop={crop_info['crop_str']}",
+                    "-map", "0:v:0",
+                    "-map", "0:a?"
+                ] + video_args + ["-c:a", "aac", "-b:a", "128k", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(temp_part_file)]
+                success, err_msg = execute_ffmpeg_with_progress(
+                    fallback_cmd,
+                    seg_dur,
+                    current_file=final_part_path,
+                    current_idx=idx,
+                    total_files=len(segments)
+                )
 
-        part_size = temp_part_file.stat().st_size
-        total_written_bytes += part_size
-        safe_move_file(temp_part_file, final_part_path)
-        t_part_cost = time.time() - t_part_start
-        print(f"  * [完成] 分段 {idx} 裁剪成功! 耗时: {t_part_cost:.1f}s | 大小: {format_bytes(part_size)} | 导出路径: {final_part_path.resolve()}")
-        success_segments += 1
+            if not success or not temp_part_file.exists() or temp_part_file.stat().st_size == 0:
+                print(f"  [错误] 分段 {idx} 转码失败: {err_msg}", file=sys.stderr)
+                if temp_part_file.exists():
+                    temp_part_file.unlink(missing_ok=True)
+                continue
+
+            part_size = temp_part_file.stat().st_size
+            total_written_bytes += part_size
+            safe_move_file(temp_part_file, final_part_path)
+            t_part_cost = time.time() - t_part_start
+            print(f"  * [完成] 分段 {idx} 裁剪成功! 耗时: {t_part_cost:.1f}s | 大小: {format_bytes(part_size)} | 导出路径: {final_part_path.resolve()}")
+            success_segments += 1
+
+        finally:
+            safe_path_unlink(temp_part_file)
 
     total_cost = time.time() - t_start_all
     print(f"\n===========================================================================")
@@ -2524,7 +2692,7 @@ def process_single_video(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 本地 SSD 临时暂存路径
-    temp_dir = Path(tempfile.gettempdir())
+    temp_dir = TempFileManager.get_optimal_temp_dir(needed_bytes=orig_size)
     temp_output_file = make_safe_temp_path(
         temp_dir=temp_dir,
         prefix=f"vcrop_{os.getpid()}_",
@@ -2533,131 +2701,199 @@ def process_single_video(
         max_total_bytes=240
     )
 
-    # 6. 音频流策略
-    audio_mode = preflight_audio_mode(file_path, has_audio)
-    if audio_mode == "copy":
-        audio_args = ["-c:a", "copy"]
-        print("  * 音频策略: [无损直通 stream-copy] (保留 100% 原始音质)")
-    elif audio_mode == "aac":
-        audio_args = ["-c:a", "aac", "-b:a", "192k"]
-        print("  * 音频策略: [自动转码 AAC 192k] (原音频格式不兼容 MP4 封装)")
-    else:
-        audio_args = ["-an"]
-        print("  * 音频策略: [无音频流]")
+    try:
+        # 6. 音频流策略
+        audio_mode = preflight_audio_mode(file_path, has_audio)
+        if audio_mode == "copy":
+            audio_args = ["-c:a", "copy"]
+            print("  * 音频策略: [无损直通 stream-copy] (保留 100% 原始音质)")
+        elif audio_mode == "aac":
+            audio_args = ["-c:a", "aac", "-b:a", "192k"]
+            print("  * 音频策略: [自动转码 AAC 192k] (原音频格式不兼容 MP4 封装)")
+        else:
+            audio_args = ["-an"]
+            print("  * 音频策略: [无音频流]")
 
-    # 7. 构建视频编码参数
-    is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
-    gop_size = max(15, int(fps * 2))
+        # 7. 构建视频编码参数
+        is_hardware = "videotoolbox" in encoder or "rkmpp" in encoder
+        gop_size = max(15, int(fps * 2))
 
-    src_primaries = info.get("color_primaries")
-    src_trc = info.get("color_transfer")
-    src_space = info.get("color_space")
+        src_primaries = info.get("color_primaries")
+        src_trc = info.get("color_transfer")
+        src_space = info.get("color_space")
 
-    color_args: List[str] = []
-    if src_primaries and src_primaries != "unknown":
-        color_args.extend(["-color_primaries", src_primaries])
-    if src_trc and src_trc != "unknown":
-        color_args.extend(["-color_trc", src_trc])
-    if src_space and src_space != "unknown":
-        color_args.extend(["-colorspace", src_space])
+        color_args: List[str] = []
+        if src_primaries and src_primaries != "unknown":
+            color_args.extend(["-color_primaries", src_primaries])
+        if src_trc and src_trc != "unknown":
+            color_args.extend(["-color_trc", src_trc])
+        if src_space and src_space != "unknown":
+            color_args.extend(["-colorspace", src_space])
 
-    if not color_args:
-        color_args = [
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709"
+        if not color_args:
+            color_args = [
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709"
+            ]
+
+        # 提取纯视频码率（排除音频流）
+        orig_v_bitrate = info.get("video_bitrate", 0.0)
+        if orig_v_bitrate <= 0.0 and orig_bitrate > 0.0:
+            orig_v_bitrate = orig_bitrate * 0.88
+        ref_v_bitrate = orig_v_bitrate if orig_v_bitrate > 0 else 2_500_000
+
+        pixel_ratio = (crop_info["w"] * crop_info["h"]) / max(1, orig_w * orig_h)
+
+        if bitrate_kbps:
+            target_bps = bitrate_kbps * 1000
+        else:
+            # 核心防体积膨胀策略：
+            # 裁剪黑边后有效画面像素减少（如 800x480 -> 640x480，像素减少 20%）
+            # 保持等同画质密度的目标纯视频码率 = 原纯视频码率 * 像素比例 * 0.95
+            calc_bps = int(ref_v_bitrate * pixel_ratio * 0.95)
+            # 严格防倒挂上限：目标码率绝对不得高于原纯视频码率；下限保底 120 kbps (针对极低码率极老视频)
+            target_bps = max(120_000, min(int(ref_v_bitrate), calc_bps))
+
+        video_args: List[str] = []
+        if is_hardware:
+            max_rate_limit = min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15))
+            buf_size_limit = int(target_bps * 2.0)
+            if encoder == "hevc_videotoolbox":
+                video_args = [
+                    "-c:v", "hevc_videotoolbox",
+                    "-b:v", str(target_bps),
+                    "-profile:v", "main",
+                    "-spatial_aq", "1",
+                    "-bf", "2",
+                    "-tag:v", "hvc1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ] + color_args
+            elif encoder == "hevc_rkmpp":
+                video_args = [
+                    "-c:v", "hevc_rkmpp",
+                    "-b:v", str(target_bps),
+                    "-profile", "main",
+                    "-rc_mode", "0",
+                    "-tag:v", "hvc1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ]
+            elif encoder == "h264_rkmpp":
+                video_args = [
+                    "-c:v", "h264_rkmpp",
+                    "-b:v", str(target_bps),
+                    "-profile", "high",
+                    "-rc_mode", "0",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ]
+            else:
+                video_args = [
+                    "-c:v", "h264_videotoolbox",
+                    "-b:v", str(target_bps),
+                    "-profile:v", "high",
+                    "-spatial_aq", "1",
+                    "-bf", "2",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", str(max_rate_limit),
+                    "-bufsize", str(buf_size_limit)
+                ] + color_args
+            hw_label = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
+            print(f"  * 编码引擎: [{hw_label} 硬件极速加速] ({encoder})")
+            print(f"    - 原视频码率: ~{format_bitrate(orig_bitrate)} (纯视频: ~{format_bitrate(ref_v_bitrate)})")
+            print(f"    - 防膨胀目标码率: ~{format_bitrate(target_bps)} (像素减少 {(1-pixel_ratio)*100:.1f}%%，码率等比缩减)")
+        else:
+            cpu_maxrate = str(min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15)))
+            cpu_bufsize = str(int(target_bps * 2.0))
+            if encoder == "libx265":
+                video_args = [
+                    "-c:v", "libx265",
+                    "-crf", str(crf),
+                    "-preset", preset,
+                    "-tag:v", "hvc1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", cpu_maxrate,
+                    "-bufsize", cpu_bufsize
+                ] + color_args
+            else:
+                video_args = [
+                    "-c:v", "libx264",
+                    "-crf", str(crf),
+                    "-preset", preset,
+                    "-pix_fmt", "yuv420p",
+                    "-g", str(gop_size),
+                    "-maxrate", cpu_maxrate,
+                    "-bufsize", cpu_bufsize
+                ] + color_args
+            print(f"  * 编码引擎: [CPU 软件编码] ({encoder}, CRF: {crf}, Preset: {preset}) | 码率上限: ~{format_bitrate(target_bps)}")
+
+        # 8. 组装 FFmpeg 裁剪命令
+        cmd = [
+            "ffmpeg", "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-err_detect", "ignore_err",
+            "-fflags", "+discardcorrupt",
+            "-i", str(file_path),
+            "-vf", f"crop={crop_info['crop_str']}",
+            "-map", "0:v:0",
+            "-map", "0:a?"
+        ] + video_args + audio_args + [
+            "-movflags", "+faststart",
+            str(temp_output_file)
         ]
 
-    # 提取纯视频码率（排除音频流）
-    orig_v_bitrate = info.get("video_bitrate", 0.0)
-    if orig_v_bitrate <= 0.0 and orig_bitrate > 0.0:
-        orig_v_bitrate = orig_bitrate * 0.88
-    ref_v_bitrate = orig_v_bitrate if orig_v_bitrate > 0 else 2_500_000
+        print(f"  * 开始裁剪转码 -> 目标文件: {output_file.resolve()}")
+        t_start = time.time()
+        success, err_msg = execute_ffmpeg_with_progress(
+            cmd,
+            duration,
+            current_file=file_path,
+            current_idx=current_idx,
+            total_files=total_files
+        )
+        elapsed = time.time() - t_start
 
-    pixel_ratio = (crop_info["w"] * crop_info["h"]) / max(1, orig_w * orig_h)
+        # === 核心安全防线：全方位产物完整性与时长截断核验 ===
+        is_truncated = False
+        out_probe = None
+        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+            out_probe = probe_video(temp_output_file)
+            if not out_probe or not out_probe.get("width"):
+                success = False
+                err_msg = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
+            elif duration > 15.0:
+                out_dur = out_probe.get("duration", 0.0)
+                if out_dur > 0.0 and out_dur < (duration * 0.94) and (duration - out_dur) > 4.0:
+                    is_truncated = True
+                    err_msg = (
+                        f"产物严重过早截断！源时长: {duration:.1f}s ({duration/60:.1f}m)，"
+                        f"转码产物仅: {out_dur:.1f}s ({out_dur/60:.1f}m)，"
+                        f"丢失时长: {(duration - out_dur):.1f}s (缺失率: {((duration - out_dur) / duration * 100):.1f}%)"
+                    )
 
-    if bitrate_kbps:
-        target_bps = bitrate_kbps * 1000
-    else:
-        # 核心防体积膨胀策略：
-        # 裁剪黑边后有效画面像素减少（如 800x480 -> 640x480，像素减少 20%）
-        # 保持等同画质密度的目标纯视频码率 = 原纯视频码率 * 像素比例 * 0.95
-        calc_bps = int(ref_v_bitrate * pixel_ratio * 0.95)
-        # 严格防倒挂上限：目标码率绝对不得高于原纯视频码率；下限保底 120 kbps (针对极低码率极老视频)
-        target_bps = max(120_000, min(int(ref_v_bitrate), calc_bps))
+        # 硬件加速（如 RKMPP / VideoToolbox）若遇特殊编码/损坏包出现报错或意外提前截断，自动平滑切换至 CPU 软件强力容错编码
+        if (not success or is_truncated) and is_hardware:
+            if is_truncated:
+                print(f"\n  [严重警告] 硬件加速器 ({encoder}) 发生意外截断退出！\n    * {err_msg}\n    * 正在丢弃残片，并立即自动启动 CPU 软件强力容错编码 (libx264) 重新压制...")
+            else:
+                print("\n  [提示] 硬件加速转码未通过，自动平滑切换至 CPU 软件编码优化...")
 
-    video_args: List[str] = []
-    if is_hardware:
-        max_rate_limit = min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15))
-        buf_size_limit = int(target_bps * 2.0)
-        if encoder == "hevc_videotoolbox":
-            video_args = [
-                "-c:v", "hevc_videotoolbox",
-                "-b:v", str(target_bps),
-                "-profile:v", "main",
-                "-spatial_aq", "1",
-                "-bf", "2",
-                "-tag:v", "hvc1",
-                "-pix_fmt", "yuv420p",
-                "-g", str(gop_size),
-                "-maxrate", str(max_rate_limit),
-                "-bufsize", str(buf_size_limit)
-            ] + color_args
-        elif encoder == "hevc_rkmpp":
-            video_args = [
-                "-c:v", "hevc_rkmpp",
-                "-b:v", str(target_bps),
-                "-profile", "main",
-                "-rc_mode", "0",
-                "-tag:v", "hvc1",
-                "-pix_fmt", "yuv420p",
-                "-g", str(gop_size),
-                "-maxrate", str(max_rate_limit),
-                "-bufsize", str(buf_size_limit)
-            ]
-        elif encoder == "h264_rkmpp":
-            video_args = [
-                "-c:v", "h264_rkmpp",
-                "-b:v", str(target_bps),
-                "-profile", "high",
-                "-rc_mode", "0",
-                "-pix_fmt", "yuv420p",
-                "-g", str(gop_size),
-                "-maxrate", str(max_rate_limit),
-                "-bufsize", str(buf_size_limit)
-            ]
-        else:
-            video_args = [
-                "-c:v", "h264_videotoolbox",
-                "-b:v", str(target_bps),
-                "-profile:v", "high",
-                "-spatial_aq", "1",
-                "-bf", "2",
-                "-pix_fmt", "yuv420p",
-                "-g", str(gop_size),
-                "-maxrate", str(max_rate_limit),
-                "-bufsize", str(buf_size_limit)
-            ] + color_args
-        hw_label = "Rockchip RKMPP" if "rkmpp" in encoder else "Apple VideoToolbox"
-        print(f"  * 编码引擎: [{hw_label} 硬件极速加速] ({encoder})")
-        print(f"    - 原视频码率: ~{format_bitrate(orig_bitrate)} (纯视频: ~{format_bitrate(ref_v_bitrate)})")
-        print(f"    - 防膨胀目标码率: ~{format_bitrate(target_bps)} (像素减少 {(1-pixel_ratio)*100:.1f}%%，码率等比缩减)")
-    else:
-        cpu_maxrate = str(min(int(target_bps * 1.25), int(ref_v_bitrate * 1.15)))
-        cpu_bufsize = str(int(target_bps * 2.0))
-        if encoder == "libx265":
-            video_args = [
-                "-c:v", "libx265",
-                "-crf", str(crf),
-                "-preset", preset,
-                "-tag:v", "hvc1",
-                "-pix_fmt", "yuv420p",
-                "-g", str(gop_size),
-                "-maxrate", cpu_maxrate,
-                "-bufsize", cpu_bufsize
-            ] + color_args
-        else:
-            video_args = [
+            safe_path_unlink(temp_output_file)
+
+            cpu_maxrate = f"{int(target_bps * 1.5 / 1000)}k"
+            cpu_bufsize = f"{int(target_bps * 3.0 / 1000)}k"
+            sw_video_args = [
                 "-c:v", "libx264",
                 "-crf", str(crf),
                 "-preset", preset,
@@ -2666,161 +2902,98 @@ def process_single_video(
                 "-maxrate", cpu_maxrate,
                 "-bufsize", cpu_bufsize
             ] + color_args
-        print(f"  * 编码引擎: [CPU 软件编码] ({encoder}, CRF: {crf}, Preset: {preset}) | 码率上限: ~{format_bitrate(target_bps)}")
 
-    # 8. 组装 FFmpeg 裁剪命令
-    cmd = [
-        "ffmpeg", "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-err_detect", "ignore_err",
-        "-fflags", "+discardcorrupt",
-        "-i", str(file_path),
-        "-vf", f"crop={crop_info['crop_str']}",
-        "-map", "0:v:0",
-        "-map", "0:a?"
-    ] + video_args + audio_args + [
-        "-movflags", "+faststart",
-        str(temp_output_file)
-    ]
-
-    print(f"  * 开始裁剪转码 -> 目标文件: {output_file.resolve()}")
-    t_start = time.time()
-    success, err_msg = execute_ffmpeg_with_progress(
-        cmd,
-        duration,
-        current_file=file_path,
-        current_idx=current_idx,
-        total_files=total_files
-    )
-    elapsed = time.time() - t_start
-
-    # === 核心安全防线：全方位产物完整性与时长截断核验 ===
-    is_truncated = False
-    out_probe = None
-    if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
-        out_probe = probe_video(temp_output_file)
-        if not out_probe or not out_probe.get("width"):
-            success = False
-            err_msg = "产物无有效视频画面流 (生成的文件可能破损或为空壳)"
-        elif duration > 15.0:
-            out_dur = out_probe.get("duration", 0.0)
-            if out_dur > 0.0 and out_dur < (duration * 0.94) and (duration - out_dur) > 4.0:
-                is_truncated = True
-                err_msg = (
-                    f"产物严重过早截断！源时长: {duration:.1f}s ({duration/60:.1f}m)，"
-                    f"转码产物仅: {out_dur:.1f}s ({out_dur/60:.1f}m)，"
-                    f"丢失时长: {(duration - out_dur):.1f}s (缺失率: {((duration - out_dur) / duration * 100):.1f}%)"
-                )
-
-    # 硬件加速（如 RKMPP / VideoToolbox）若遇特殊编码/损坏包出现报错或意外提前截断，自动平滑切换至 CPU 软件强力容错编码
-    if (not success or is_truncated) and is_hardware:
-        if is_truncated:
-            print(f"\n  [严重警告] 硬件加速器 ({encoder}) 发生意外截断退出！\n    * {err_msg}\n    * 正在丢弃残片，并立即自动启动 CPU 软件强力容错编码 (libx264) 重新压制...")
-        else:
-            print("\n  [提示] 硬件加速转码未通过，自动平滑切换至 CPU 软件编码优化...")
-
-        safe_path_unlink(temp_output_file)
-
-        cpu_maxrate = f"{int(target_bps * 1.5 / 1000)}k"
-        cpu_bufsize = f"{int(target_bps * 3.0 / 1000)}k"
-        sw_video_args = [
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", preset,
-            "-pix_fmt", "yuv420p",
-            "-g", str(gop_size),
-            "-maxrate", cpu_maxrate,
-            "-bufsize", cpu_bufsize
-        ] + color_args
-
-        cmd_sw = [
-            "ffmpeg", "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-max_error_rate", "1.0",
-            "-err_detect", "ignore_err",
-            "-fflags", "+discardcorrupt+genpts",
-            "-i", str(file_path),
-            "-vf", f"crop={crop_info['crop_str']}",
-            "-map", "0:v:0",
-            "-map", "0:a?"
-        ] + sw_video_args + audio_args + [
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            str(temp_output_file)
-        ]
-        success, err_msg = execute_ffmpeg_with_progress(
-            cmd_sw,
-            duration,
-            current_file=file_path,
-            current_idx=current_idx,
-            total_files=total_files
-        )
-        is_truncated = False
-        if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
-            out_probe = probe_video(temp_output_file)
-            if not out_probe or not out_probe.get("width"):
-                success = False
-                err_msg = "CPU 软件转码产物无有效视频流"
-            elif duration > 15.0:
-                out_dur = out_probe.get("duration", 0.0)
-                if out_dur > 0.0 and out_dur < (duration * 0.94) and (duration - out_dur) > 4.0:
-                    is_truncated = True
-                    err_msg = f"CPU 软件转码后依然截断 (源时长: {duration:.1f}s, 产物仅: {out_dur:.1f}s)！原片损坏严重"
+            cmd_sw = [
+                "ffmpeg", "-y",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-max_error_rate", "1.0",
+                "-err_detect", "ignore_err",
+                "-fflags", "+discardcorrupt+genpts",
+                "-i", str(file_path),
+                "-vf", f"crop={crop_info['crop_str']}",
+                "-map", "0:v:0",
+                "-map", "0:a?"
+            ] + sw_video_args + audio_args + [
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                str(temp_output_file)
+            ]
+            success, err_msg = execute_ffmpeg_with_progress(
+                cmd_sw,
+                duration,
+                current_file=file_path,
+                current_idx=current_idx,
+                total_files=total_files
+            )
+            is_truncated = False
+            if success and safe_path_exists(temp_output_file) and temp_output_file.stat().st_size > 0:
+                out_probe = probe_video(temp_output_file)
+                if not out_probe or not out_probe.get("width"):
                     success = False
-        else:
+                    err_msg = "CPU 软件转码产物无有效视频流"
+                elif duration > 15.0:
+                    out_dur = out_probe.get("duration", 0.0)
+                    if out_dur > 0.0 and out_dur < (duration * 0.94) and (duration - out_dur) > 4.0:
+                        is_truncated = True
+                        err_msg = f"CPU 软件转码后依然截断 (源时长: {duration:.1f}s, 产物仅: {out_dur:.1f}s)！原片损坏严重"
+                        success = False
+            else:
+                success = False
+
+        if is_truncated:
             success = False
 
-    if is_truncated:
-        success = False
+        if not success or not safe_path_exists(temp_output_file) or temp_output_file.stat().st_size == 0:
+            err_snippet = err_msg if not success else "生成的临时输出文件为空"
+            print(f"\n  [错误] 裁剪转码失败: {err_snippet}", file=sys.stderr)
+            safe_path_unlink(temp_output_file)
+            if vlog:
+                vlog.log_processed(
+                    input_file=file_path,
+                    output_target=output_file,
+                    status="FAILED",
+                    action="AUTOCROP",
+                    orig_size=orig_size,
+                    elapsed_sec=elapsed,
+                    orig_info=info,
+                    details=f"裁剪转码失败: {err_snippet}",
+                    tool="vcrop"
+                )
+            return False
 
-    if not success or not safe_path_exists(temp_output_file) or temp_output_file.stat().st_size == 0:
-        err_snippet = err_msg if not success else "生成的临时输出文件为空"
-        print(f"\n  [错误] 裁剪转码失败: {err_snippet}", file=sys.stderr)
-        safe_path_unlink(temp_output_file)
+        new_size = temp_output_file.stat().st_size
+        size_diff = (new_size - orig_size) / orig_size * 100 if orig_size > 0 else 0
+
+        # 安全原子移动到最终输出路径
+        safe_move_file(temp_output_file, output_file)
+
+        print(f"\n[完成] 裁剪成功! 耗时: {elapsed:.1f}s")
+        print(f"  * 最终输出: {output_file.resolve()}")
+        print(f"  * 文件大小: {format_bytes(orig_size)} -> {format_bytes(new_size)} ({size_diff:+.1f}%)")
         if vlog:
             vlog.log_processed(
                 input_file=file_path,
                 output_target=output_file,
-                status="FAILED",
+                status="SUCCESS",
                 action="AUTOCROP",
                 orig_size=orig_size,
+                new_size=new_size,
                 elapsed_sec=elapsed,
                 orig_info=info,
-                details=f"裁剪转码失败: {err_snippet}",
+                details=f"去黑边 crop={crop_info['crop_str']} (上={crop_info.get('top',0)} 下={crop_info.get('bottom',0)} 左={crop_info.get('left',0)} 右={crop_info.get('right',0)})",
                 tool="vcrop"
             )
-        return False
 
-    new_size = temp_output_file.stat().st_size
-    size_diff = (new_size - orig_size) / orig_size * 100 if orig_size > 0 else 0
+        # 9. 源文件清理逻辑（内置安全熔断核验）
+        if delete_source:
+            remove_source_files([file_path], output_file, reason="视频去黑边成功后安全清理源文件 (--delete-source)", tool="vcrop")
 
-    # 安全原子移动到最终输出路径
-    safe_move_file(temp_output_file, output_file)
+        return True
+    finally:
+        safe_path_unlink(temp_output_file)
+        TempFileManager.cleanup_stale_temp_files(custom_dirs=[temp_dir])
 
-    print(f"\n[完成] 裁剪成功! 耗时: {elapsed:.1f}s")
-    print(f"  * 最终输出: {output_file.resolve()}")
-    print(f"  * 文件大小: {format_bytes(orig_size)} -> {format_bytes(new_size)} ({size_diff:+.1f}%)")
-    if vlog:
-        vlog.log_processed(
-            input_file=file_path,
-            output_target=output_file,
-            status="SUCCESS",
-            action="AUTOCROP",
-            orig_size=orig_size,
-            new_size=new_size,
-            elapsed_sec=elapsed,
-            orig_info=info,
-            details=f"去黑边 crop={crop_info['crop_str']} (上={crop_info.get('top',0)} 下={crop_info.get('bottom',0)} 左={crop_info.get('left',0)} 右={crop_info.get('right',0)})",
-            tool="vcrop"
-        )
-
-    # 9. 源文件清理逻辑（内置安全熔断核验）
-    if delete_source:
-        remove_source_files([file_path], output_file, reason="视频去黑边成功后安全清理源文件 (--delete-source)", tool="vcrop")
-
-    return True
 
 
 def normalize_and_resolve_path(path_input: Union[str, Path]) -> Path:
@@ -2939,6 +3112,27 @@ def normalize_cli_args(raw_args: List[str]) -> List[str]:
             continue
         if arg == "-stop":
             norm_args.append("--stop")
+            i += 1
+            continue
+
+        # 临时缓存清理与自定义临时目录容错
+        if arg in ("--clean-tmp", "--clean-temp", "-clean-tmp", "-clean-temp"):
+            norm_args.append("--clean-tmp")
+            i += 1
+            continue
+
+        if arg in ("--temp-dir", "-temp-dir", "--tempdir", "-tempdir"):
+            if i + 1 < len(raw_args):
+                norm_args.extend(["--temp-dir", raw_args[i + 1]])
+                i += 2
+                continue
+            norm_args.append("--temp-dir")
+            i += 1
+            continue
+
+        if arg.startswith(("--temp-dir=", "-temp-dir=", "--tempdir=", "-tempdir=")):
+            val = arg.split("=", 1)[1]
+            norm_args.extend(["--temp-dir", val])
             i += 1
             continue
 
@@ -3170,8 +3364,34 @@ def main():
     log_group.add_argument("--log-dir", type=str, default=None, help="自定义日志保存目录 (默认全自动存储至: ~/.vfix/logs/)")
     log_group.add_argument("--no-log", action="store_true", help="禁用所有文件处理与删除日志记录 (默认已开启自动记录)")
 
+    # 临时缓存清理与存储控制 (杜绝磁盘满)
+    tmp_group = parser.add_argument_group("临时存储与磁盘空间安全管理 (杜绝磁盘写满)")
+    tmp_group.add_argument("--clean-tmp", "--clean-temp", dest="clean_tmp", action="store_true",
+                           help="扫描并彻底清理历史遗留的僵尸临时文件 (因异常中断、断电等残留的 vcrop_* / vrc_* 缓存并释放空间)")
+    tmp_group.add_argument("--temp-dir", dest="temp_dir", type=str, default=None,
+                           help="指定自定义临时文件暂存目录 (默认自动优先选用大容量持久存储如 ~/.vfix/tmp 或 /var/tmp，杜绝 /tmp tmpfs 内存盘打满)")
+
     norm_argv = normalize_cli_args(sys.argv[1:])
     args = parser.parse_args(norm_argv)
+
+    if args.temp_dir:
+        custom_tmp = Path(args.temp_dir).expanduser().resolve()
+        custom_tmp.mkdir(parents=True, exist_ok=True)
+        os.environ["VFIX_TEMP_DIR"] = str(custom_tmp)
+
+    if args.clean_tmp:
+        print("[临时文件清理] 正在扫描历史遗留的临时缓存与僵尸文件...")
+        cnt, b = TempFileManager.cleanup_stale_temp_files(verbose=True)
+        if cnt > 0:
+            print(f"[清理完成] 共清理 {cnt} 个遗留临时文件，成功释放磁盘空间: {vlog.format_bytes(b)}。")
+        else:
+            print("[清理完成] 系统环境非常干净，未发现需要清理的遗留临时文件。")
+        sys.exit(0)
+
+    # 启动自检并安全回收先前异常中断遗留的死进程缓存
+    stale_cnt, stale_bytes = TempFileManager.cleanup_stale_temp_files(verbose=False)
+    if stale_bytes > 0:
+        print(f"  * [空间卫士] 启动自检: 已自动回收先前异常中断遗留的 {stale_cnt} 个僵尸缓存文件 (释放 {vlog.format_bytes(stale_bytes)})")
 
     global DAEMON_MGR
     vlog.setup_logger(log_dir=args.log_dir, enabled=not args.no_log, tool_name="vcrop")
